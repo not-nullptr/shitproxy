@@ -275,7 +275,11 @@ export function createGateway(config: GatewayConfig) {
                 : 'api_error';
         if (upstream.headers.has('retry-after'))
           res.setHeader('retry-after', upstream.headers.get('retry-after')!);
-        throw new ProtocolError(`Upstream returned HTTP ${upstream.status}`, status, kind);
+        throw new ProtocolError(
+          `Upstream /v1/responses returned HTTP ${upstream.status} for model ${JSON.stringify(request!.model)}`,
+          status,
+          kind,
+        );
       }
       if (translated!.stream) {
         if (

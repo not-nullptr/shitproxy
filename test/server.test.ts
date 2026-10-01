@@ -260,7 +260,10 @@ describe('HTTP routing and protocol integration', () => {
     });
     const result = await post(base);
     expect(result.status).toBe(status);
-    expect(await result.text()).not.toContain('sensitive');
+    const error = await result.text();
+    expect(error).not.toContain('sensitive');
+    expect(error).toContain('/v1/responses');
+    expect(error).toContain(request.model);
     expect(result.headers.get('retry-after')).toBe('4');
   });
   it('redirects are not followed or leaked credentials', async () => {
