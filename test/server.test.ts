@@ -588,3 +588,57 @@ describe('web client hardcoded Haiku alias', () => {
     expect(received).toBe(raw);
   });
 });
+
+describe('web client Sonnet alias', () => {
+  it.each([false, true])(
+    'routes claude-sonnet-5-5 to native Messages with stream=%s',
+    async (stream) => {
+      let captured: any;
+      const nativeResponse = stream
+        ? 'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+        : '{"native":true}';
+      const { base } = await setup(async (req, res) => {
+        captured = { url: req.url, headers: req.headers, body: JSON.parse(await read(req)) };
+        res.setHeader('content-type', stream ? 'text/event-stream' : 'application/json');
+        res.end(nativeResponse);
+      });
+      const payload = {
+        ...request,
+        model: 'claude-sonnet-5-5',
+        stream,
+        unknown_native_field: { preserved: true },
+        thinking: { type: 'adaptive' },
+      };
+      const result = await post(base, payload, { 'anthropic-beta': 'native-beta' });
+      expect(result.status).toBe(200);
+      expect(await result.text()).toBe(nativeResponse);
+      expect(captured.url).toBe('/v1/messages');
+      expect(captured.body).toEqual({ ...payload, model: 'anthropic/claude-sonnet-5-5' });
+      expect(captured.headers['anthropic-beta']).toBe('native-beta');
+      expect(captured.headers['x-api-key']).toBe('upstream-secret');
+    },
+  );
+  it.each(['claude-sonnet-5-5-extra', 'claude-sonnet-5-6', 'openrouter/claude-sonnet-5-5'])(
+    'keeps %s on Responses',
+    async (model) => {
+      let captured: any;
+      const { base } = await setup(async (req, res) => {
+        captured = { url: req.url, body: JSON.parse(await read(req)) };
+        res.end(JSON.stringify(output));
+      });
+      expect((await post(base, { ...request, model })).status).toBe(200);
+      expect(captured.url).toBe('/v1/responses');
+      expect(captured.body.model).toBe(model);
+    },
+  );
+  it('preserves already-prefixed Sonnet JSON bytes', async () => {
+    const raw = '{ "model": "anthropic/claude-sonnet-5-5", "custom": true }\n';
+    let received = '';
+    const { base } = await setup(async (req, res) => {
+      received = await read(req);
+      res.end('{}');
+    });
+    expect((await post(base, raw)).status).toBe(200);
+    expect(received).toBe(raw);
+  });
+});

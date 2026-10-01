@@ -224,9 +224,9 @@ export function createGateway(config: GatewayConfig) {
         if (typeof request.model !== 'string' || !request.model.length)
           throw new ProtocolError('model must be a non-empty string');
         let model = request.model;
-        // The web client hardcodes this bare ID for its Haiku requests.
-        if (model === 'claude-haiku-4-5-20251001') {
-          model = 'anthropic/claude-haiku-4-5-20251001';
+        // Exact bare IDs observed in requests from the web client.
+        if (model === 'claude-haiku-4-5-20251001' || model === 'claude-sonnet-5-5') {
+          model = `anthropic/${model}`;
           request.model = model;
           raw = Buffer.from(JSON.stringify(request), 'utf8');
         }
