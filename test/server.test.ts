@@ -530,3 +530,58 @@ it('upstream empty response body fails explicitly', async () => {
   );
   expect((await post(base)).status).toBe(502);
 });
+
+describe('web client hardcoded Haiku alias', () => {
+  it.each([false, true])('routes alias through native Messages with stream=%s', async (stream) => {
+    let captured: any;
+    const nativeResponse = stream
+      ? 'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+      : '{"native":true}';
+    const { base } = await setup(async (req, res) => {
+      captured = { url: req.url, headers: req.headers, body: JSON.parse(await read(req)) };
+      res.setHeader('content-type', stream ? 'text/event-stream' : 'application/json');
+      res.end(nativeResponse);
+    });
+    const payload = {
+      model: 'claude-haiku-4-5-20251001',
+      stream,
+      max_tokens: 128,
+      messages: [{ role: 'user', content: 'hello 🌎' }],
+      unknown_native_field: { keep: [1, true, null] },
+      thinking: { type: 'adaptive' },
+    };
+    const result = await post(base, payload, { 'anthropic-beta': 'native-beta' });
+    expect(result.status).toBe(200);
+    expect(await result.text()).toBe(nativeResponse);
+    expect(captured.url).toBe('/v1/messages');
+    expect(captured.body).toEqual({ ...payload, model: 'anthropic/claude-haiku-4-5-20251001' });
+    expect(captured.headers['anthropic-beta']).toBe('native-beta');
+    expect(captured.headers['x-api-key']).toBe('upstream-secret');
+  });
+  it.each([
+    'claude-haiku-4-5-20251002',
+    'claude-haiku-4-5',
+    'claude-haiku-4-5-20251001-extra',
+    'CLAUDE-HAIKU-4-5-20251001',
+    'openrouter/claude-haiku-4-5-20251001',
+  ])('does not rewrite nearby model ID %s', async (model) => {
+    let captured: any;
+    const { base } = await setup(async (req, res) => {
+      captured = { url: req.url, body: JSON.parse(await read(req)) };
+      res.end(JSON.stringify(output));
+    });
+    expect((await post(base, { ...request, model })).status).toBe(200);
+    expect(captured.url).toBe('/v1/responses');
+    expect(captured.body.model).toBe(model);
+  });
+  it('already-prefixed Haiku stays byte-for-byte unchanged', async () => {
+    const raw = '{ "model": "anthropic/claude-haiku-4-5-20251001", "custom": true }\n';
+    let received = '';
+    const { base } = await setup(async (req, res) => {
+      received = await read(req);
+      res.end('{}');
+    });
+    expect((await post(base, raw)).status).toBe(200);
+    expect(received).toBe(raw);
+  });
+});

@@ -223,7 +223,14 @@ export function createGateway(config: GatewayConfig) {
         }
         if (typeof request.model !== 'string' || !request.model.length)
           throw new ProtocolError('model must be a non-empty string');
-        native = request.model.startsWith('anthropic/');
+        let model = request.model;
+        // The web client hardcodes this bare ID for its Haiku requests.
+        if (model === 'claude-haiku-4-5-20251001') {
+          model = 'anthropic/claude-haiku-4-5-20251001';
+          request.model = model;
+          raw = Buffer.from(JSON.stringify(request), 'utf8');
+        }
+        native = model.startsWith('anthropic/');
       }
       const translated = messages && !native ? toResponses(request) : undefined;
       const target = new URL(base);

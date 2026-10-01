@@ -3,7 +3,8 @@
 A dedicated TypeScript gateway for Claude clients using a router that serves both Anthropic Messages and OpenAI Responses.
 
 - `POST /v1/messages`, model starts with **`anthropic/`**: send the original JSON bytes to upstream `/v1/messages`. Native tools, thinking, signatures, beta headers, errors, and SSE stay on the Anthropic path.
-- Every other model: translate Messages to upstream `/v1/responses`, then translate JSON or streaming SSE back to Messages. **Preserve the model ID exactly.** Bare `claude-*` IDs are not rewritten.
+- The web client's exact bare ID `claude-haiku-4-5-20251001` is rewritten to `anthropic/claude-haiku-4-5-20251001` and routed to native Messages. Its JSON body is reserialized for this rewrite; other fields are retained.
+- Every other model: translate Messages to upstream `/v1/responses`, then translate JSON or streaming SSE back to Messages. **Preserve the model ID exactly.** Other bare `claude-*` IDs are not rewritten.
 - `GET /v1/models`: proxy the upstream model listing, including query parameters.
 - `GET /healthz`: local process liveness, without making a model request.
 
