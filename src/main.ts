@@ -17,6 +17,7 @@ const server = createGateway({
   clientApiKey: process.env.GATEWAY_API_KEY,
   timeoutMs: positive('UPSTREAM_TIMEOUT_MS', 600000),
   maxBodyBytes: positive('MAX_BODY_BYTES', 33554432),
+  debugStream: process.env.DEBUG_STREAM === '1',
 });
 server.listen(port, host, () => console.log(`Gateway listening on http://${host}:${port}`));
 for (const signal of ['SIGINT', 'SIGTERM'] as const)

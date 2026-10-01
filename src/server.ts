@@ -1,5 +1,6 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { timingSafeEqual } from 'node:crypto';
+import { timingSafeEqual, randomUUID } from 'node:crypto';
+import { traceShape } from './trace.js';
 import { ProtocolError, record } from './protocol.js';
 import { toResponses, toMessage } from './translate.js';
 import { parseSse, sse, translateStream } from './stream.js';
@@ -13,6 +14,7 @@ export type GatewayConfig = {
   maxSseFrameBytes?: number;
   maxStreamBytes?: number;
   fetch?: typeof fetch;
+  debugStream?: boolean;
 };
 const HOP = new Set([
   'connection',
@@ -196,6 +198,11 @@ export function createGateway(config: GatewayConfig) {
     res.on('close', abort);
     req.on('aborted', abort);
     let translatedStream = false;
+    const traceId = config.debugStream ? randomUUID() : undefined;
+    const trace = (direction: string, event: unknown) => {
+      if (traceId)
+        console.error(JSON.stringify({ trace_id: traceId, direction, ...traceShape(event) }));
+    };
     try {
       const url = new URL(req.url ?? '/', 'http://localhost');
       if (url.pathname === '/healthz' && req.method === 'GET') {
@@ -300,12 +307,26 @@ export function createGateway(config: GatewayConfig) {
         });
         res.flushHeaders();
         translatedStream = true;
+        async function* tracedUpstream() {
+          for await (const frame of parseSse(upstream.body!, config.maxSseFrameBytes)) {
+            if (traceId) {
+              try {
+                trace('upstream', JSON.parse(frame.data));
+              } catch {
+                trace('upstream', { type: 'unparseable_frame' });
+              }
+            }
+            yield frame;
+          }
+        }
         for await (const event of translateStream(
-          parseSse(upstream.body, config.maxSseFrameBytes),
+          tracedUpstream(),
           request!.model as string,
           config.maxStreamBytes,
-        ))
+        )) {
+          trace('downstream', event);
           await write(res, sse(event));
+        }
         res.end();
       } else {
         const output = toMessage(
