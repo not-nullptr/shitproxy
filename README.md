@@ -69,22 +69,24 @@ Assistant message phases (`commentary`, `final_answer`, or null) are also preser
 
 ## Translation support and boundaries
 
-| Feature                         | Responses path                                                                                                      |
-| ------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
-| System/user/assistant text      | Supported, preserving message/block order                                                                           |
-| URL and base64 images           | User input and tool results; no image downloads by the gateway                                                      |
-| Client tool calls and results   | Supported, including parallel Task/subagent calls and nested JSON                                                   |
-| Tool choice                     | auto, any/required, none, named function, parallel disabling                                                        |
-| Tool errors                     | Explicit `[tool_error]` marker in tool result content                                                               |
-| Summary and encrypted reasoning | Lossless item replay through versioned envelopes                                                                    |
-| Plaintext reasoning             | Optional upstream `reasoning_text` preserved                                                                        |
-| JSON schema output              | Mapped to Responses structured output; upstream validates schema support                                            |
-| Thinking budget                 | Approximate effort mapping: below 2048 low, below 8192 medium, otherwise high                                       |
-| Adaptive thinking               | medium effort by default                                                                                            |
-| Explicit effort                 | low/medium/high unchanged; Anthropic max maps to Responses xhigh                                                    |
-| Cache-control hints             | Accepted but not mapped; upstream manages caching                                                                   |
-| Usage                           | Cached input removed from Anthropic input_tokens and reported as cache_read_input_tokens                            |
-| Streaming                       | UTF-8/CRLF framing, fragmented JSON arguments, ordered blocks, final signatures, usage, refusals, incomplete output |
+| Feature                              | Responses path                                                                                                      |
+| ------------------------------------ | ------------------------------------------------------------------------------------------------------------------- |
+| System/developer/user/assistant text | Supported, preserving message/block order                                                                           |
+| URL and base64 images                | User input and tool results; no image downloads by the gateway                                                      |
+| Client tool calls and results        | Supported, including parallel Task/subagent calls and nested JSON                                                   |
+| Tool choice                          | auto, any/required, none, named function, parallel disabling                                                        |
+| Tool errors                          | Explicit `[tool_error]` marker in tool result content                                                               |
+| Summary and encrypted reasoning      | Lossless item replay through versioned envelopes                                                                    |
+| Plaintext reasoning                  | Optional upstream `reasoning_text` preserved                                                                        |
+| JSON schema output                   | Mapped to Responses structured output; upstream validates schema support                                            |
+| Thinking budget                      | Approximate effort mapping: below 2048 low, below 8192 medium, otherwise high                                       |
+| Adaptive thinking                    | medium effort by default                                                                                            |
+| Explicit effort                      | low/medium/high unchanged; Anthropic max maps to Responses xhigh                                                    |
+| Cache-control hints                  | Accepted but not mapped; upstream manages caching                                                                   |
+| Usage                                | Cached input removed from Anthropic input_tokens and reported as cache_read_input_tokens                            |
+| Streaming                            | UTF-8/CRLF framing, fragmented JSON arguments, ordered blocks, final signatures, usage, refusals, incomplete output |
+
+For web-client compatibility, translated message history may include text-only `system` and `developer` roles. These retain their instruction roles and history positions. Other unsupported roles are reported by name without including message content.
 
 The protocols are not identical. `budget_tokens` cannot impose an exact Responses reasoning token budget. A provider can reject unsupported effort, sampling, structured output, image, or reasoning settings; the gateway preserves that failure instead of silently retrying with reduced capabilities.
 

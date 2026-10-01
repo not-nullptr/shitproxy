@@ -301,7 +301,7 @@ describe('fail explicit on invalid or unsupported inputs', () => {
     { temperature: 1.1 },
     { top_p: 2 },
     { tools: [{ type: 'web_search_20250305', name: 'search' }] },
-    { messages: [{ role: 'system', content: 'x' }] },
+    { messages: [{ role: 'unknown', content: 'x' }] },
     { messages: [{ role: 'user', content: [{ type: 'document', source: {} }] }] },
     { messages: [{ role: 'user', content: [{ type: 'text', text: 1 }] }] },
     { messages: [{ role: 'user', content: [{ type: 'text', text: 'x', citations: [] }] }] },
@@ -652,3 +652,76 @@ it('invalid UTF8 envelope rejected', () =>
   expect(() =>
     decodeReasoning('spx:reasoning:v1:' + Buffer.from([255]).toString('base64url')),
   ).toThrow(/Malformed/));
+
+describe('web client instruction roles', () => {
+  it.each(['system', 'developer'] as const)(
+    'preserves %s text messages and history order',
+    (role) => {
+      const translated = toResponses(
+        req({
+          system: 'top-level instructions',
+          messages: [
+            { role: 'user', content: 'hello' },
+            {
+              role,
+              content: [
+                { type: 'text', text: 'instruction one' },
+                { type: 'text', text: 'instruction two' },
+              ],
+            },
+            { role: 'assistant', content: 'answer' },
+          ],
+        }),
+      );
+      expect(translated.input).toEqual([
+        { role: 'system', content: [{ type: 'input_text', text: 'top-level instructions' }] },
+        { role: 'user', content: [{ type: 'input_text', text: 'hello' }] },
+        {
+          role,
+          content: [
+            { type: 'input_text', text: 'instruction one' },
+            { type: 'input_text', text: 'instruction two' },
+          ],
+        },
+        { role: 'assistant', content: [{ type: 'output_text', text: 'answer', annotations: [] }] },
+      ]);
+    },
+  );
+  it.each(['system', 'developer'])('accepts %s string content', (role) => {
+    expect(toResponses(req({ messages: [{ role, content: 'instructions' }] })).input).toEqual([
+      { role, content: [{ type: 'input_text', text: 'instructions' }] },
+    ]);
+  });
+  it.each(['system', 'developer'])('rejects non-text %s images', (role) => {
+    expect(() =>
+      toResponses(
+        req({
+          messages: [
+            {
+              role,
+              content: [
+                { type: 'image', source: { type: 'url', url: 'https://example.com/a.png' } },
+              ],
+            },
+          ],
+        }),
+      ),
+    ).toThrow(/user role/);
+  });
+  it.each(['system', 'developer'])('rejects %s tool calls and reasoning', (role) => {
+    for (const block of [call, { type: 'thinking', thinking: 'x' }])
+      expect(() => toResponses(req({ messages: [{ role, content: [block] }] }))).toThrow();
+  });
+  it.each(['tool', 'model', 'human', 'function'])('reports actual unsupported role %s', (role) => {
+    expect(() =>
+      toResponses(
+        req({
+          messages: [
+            { role: 'user', content: 'secret prompt' },
+            { role, content: 'secret second prompt' },
+          ],
+        }),
+      ),
+    ).toThrow(`messages.1.role: unsupported role "${role}"`);
+  });
+});

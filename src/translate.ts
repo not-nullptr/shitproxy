@@ -18,14 +18,14 @@ import {
 import { blockToReasoning, reasoningToBlock } from './reasoning.js';
 export function inputPart(
   block: Extract<Block, { type: 'text' | 'image' }>,
-  role: 'user' | 'assistant' = 'user',
+  role: 'user' | 'assistant' | 'system' | 'developer' = 'user',
 ): JsonObject {
   if (block.type === 'text')
     return role === 'assistant'
       ? { type: 'output_text', text: block.text, annotations: [] }
       : { type: 'input_text', text: block.text };
-  if (role === 'assistant')
-    throw new ProtocolError('Assistant image history cannot be translated to Responses');
+  if (role !== 'user')
+    throw new ProtocolError('Image content requires user role on the Responses path');
   const src = block.source;
   if (src.type === 'url' && !/^https?:\/\//.test(src.url))
     throw new ProtocolError('Image URLs must use HTTP or HTTPS');

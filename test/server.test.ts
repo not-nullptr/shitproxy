@@ -642,3 +642,44 @@ describe('web client Sonnet alias', () => {
     expect(received).toBe(raw);
   });
 });
+
+it.each(['system', 'developer'])(
+  'web client %s history reaches Responses without changing its role',
+  async (role) => {
+    let captured: any;
+    const { base } = await setup(async (req, res) => {
+      captured = { url: req.url, body: JSON.parse(await read(req)) };
+      res.end(JSON.stringify(output));
+    });
+    const result = await post(base, {
+      ...request,
+      model: 'openrouter/glm-5.3-flash',
+      messages: [
+        { role: 'user', content: 'hi' },
+        { role, content: 'instructions' },
+      ],
+    });
+    expect(result.status).toBe(200);
+    expect(captured.url).toBe('/v1/responses');
+    expect(captured.body.model).toBe('openrouter/glm-5.3-flash');
+    expect(captured.body.input[1]).toEqual({
+      role,
+      content: [{ type: 'input_text', text: 'instructions' }],
+    });
+  },
+);
+it('unsupported role errors name the role without revealing message contents', async () => {
+  const { base } = await setup(() => {});
+  const result = await post(base, {
+    ...request,
+    messages: [
+      { role: 'user', content: 'secret first message' },
+      { role: 'tool', content: 'secret tool output' },
+    ],
+  });
+  expect(result.status).toBe(400);
+  const error = await result.text();
+  expect(error).toContain('unsupported role');
+  expect(error).toContain('tool');
+  expect(error).not.toContain('secret');
+});

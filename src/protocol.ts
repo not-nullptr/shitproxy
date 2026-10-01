@@ -59,7 +59,7 @@ export const requestSchema = z
       .array(
         z
           .object({
-            role: z.enum(['user', 'assistant']),
+            role: z.enum(['user', 'assistant', 'system', 'developer']),
             content: z.union([z.string(), z.array(blockSchema)]),
           })
           .strict(),
@@ -142,6 +142,19 @@ export const reasoningSchema = z
   })
   .strict();
 export function parseRequest(value: unknown): MessagesRequest {
+  // Web clients may put instruction messages in history instead of top-level system.
+  if (value && typeof value === 'object' && 'messages' in value && Array.isArray(value.messages)) {
+    for (const [index, message] of value.messages.entries()) {
+      if (!message || typeof message !== 'object' || !('role' in message)) continue;
+      const role = message.role;
+      if (!['user', 'assistant', 'system', 'developer'].includes(role)) {
+        const actual = typeof role === 'string' ? JSON.stringify(role.slice(0, 80)) : typeof role;
+        throw new ProtocolError(
+          `Invalid Messages request: messages.${index}.role: unsupported role ${actual}`,
+        );
+      }
+    }
+  }
   const parsed = requestSchema.safeParse(value);
   if (!parsed.success)
     throw new ProtocolError(
