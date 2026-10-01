@@ -1,0 +1,295 @@
+import {
+  hasMessageEnvelope,
+  messageEnvelope,
+  replayMessage,
+  visibleMessageParts,
+} from './message-state.js';
+import {
+  ProtocolError,
+  parseRequest,
+  record,
+  string,
+  upstreamError,
+  reasoningSchema,
+  type Block,
+  type JsonObject,
+  type MessagesRequest,
+} from './protocol.js';
+import { blockToReasoning, reasoningToBlock } from './reasoning.js';
+export function inputPart(
+  block: Extract<Block, { type: 'text' | 'image' }>,
+  role: 'user' | 'assistant' = 'user',
+): JsonObject {
+  if (block.type === 'text')
+    return role === 'assistant'
+      ? { type: 'output_text', text: block.text, annotations: [] }
+      : { type: 'input_text', text: block.text };
+  if (role === 'assistant')
+    throw new ProtocolError('Assistant image history cannot be translated to Responses');
+  const src = block.source;
+  if (src.type === 'url' && !/^https?:\/\//.test(src.url))
+    throw new ProtocolError('Image URLs must use HTTP or HTTPS');
+  return {
+    type: 'input_image',
+    image_url: src.type === 'url' ? src.url : `data:${src.media_type};base64,${src.data}`,
+  };
+}
+export function toResponses(value: unknown): JsonObject {
+  const req = parseRequest(value);
+  if (req.top_k !== undefined) throw new ProtocolError('top_k has no Responses equivalent');
+  if (req.stop_sequences?.length)
+    throw new ProtocolError('stop_sequences has no Responses equivalent');
+  const input: JsonObject[] = [];
+  if (req.system !== undefined)
+    input.push({
+      role: 'system',
+      content: [
+        {
+          type: 'input_text',
+          text:
+            typeof req.system === 'string' ? req.system : req.system.map((b) => b.text).join('\n'),
+        },
+      ],
+    });
+  const calls = new Set<string>(),
+    results = new Set<string>();
+  for (const message of req.messages) {
+    const blocks: Block[] =
+      typeof message.content === 'string'
+        ? [{ type: 'text', text: message.content }]
+        : message.content;
+    let content: JsonObject[] = [];
+    const flush = () => {
+      if (content.length) {
+        input.push({ role: message.role, content });
+        content = [];
+      }
+    };
+    for (const block of blocks) {
+      if (block.type === 'text' || block.type === 'image') {
+        content.push(inputPart(block, message.role));
+        continue;
+      }
+      if (hasMessageEnvelope(block)) {
+        if (message.role !== 'assistant')
+          throw new ProtocolError('Assistant message metadata requires assistant role');
+        const replay = replayMessage(block.data);
+        if (JSON.stringify(content) !== JSON.stringify(visibleMessageParts(replay)))
+          throw new ProtocolError(
+            'Assistant message text was modified after metadata was returned',
+          );
+        input.push(replay);
+        content = [];
+        continue;
+      }
+      flush();
+      if (block.type === 'tool_use') {
+        if (message.role !== 'assistant')
+          throw new ProtocolError('tool_use requires assistant role');
+        if (calls.has(block.id)) throw new ProtocolError('Duplicate tool call ID');
+        calls.add(block.id);
+        input.push({
+          type: 'function_call',
+          call_id: block.id,
+          name: block.name,
+          arguments: JSON.stringify(block.input),
+        });
+      } else if (block.type === 'tool_result') {
+        if (message.role !== 'user') throw new ProtocolError('tool_result requires user role');
+        if (!calls.has(block.tool_use_id))
+          throw new ProtocolError('Tool result has no preceding call');
+        if (results.has(block.tool_use_id)) throw new ProtocolError('Duplicate tool result');
+        results.add(block.tool_use_id);
+        let output: string | JsonObject[] =
+          typeof block.content === 'string'
+            ? block.content
+            : (block.content ?? []).map((b) => inputPart(b));
+        if (block.is_error)
+          output =
+            typeof output === 'string'
+              ? `[tool_error]\n${output}`
+              : [{ type: 'input_text', text: '[tool_error]' }, ...output];
+        input.push({ type: 'function_call_output', call_id: block.tool_use_id, output });
+      } else {
+        if (message.role !== 'assistant')
+          throw new ProtocolError('Reasoning history requires assistant role');
+        input.push(blockToReasoning(block));
+      }
+    }
+    flush();
+  }
+  const out: JsonObject = {
+    model: req.model,
+    input,
+    max_output_tokens: req.max_tokens,
+    stream: req.stream ?? false,
+    store: false,
+    include: ['reasoning.encrypted_content'],
+  };
+  for (const field of ['temperature', 'top_p'] as const)
+    if (req[field] !== undefined) out[field] = req[field];
+  if (req.tools) {
+    const names = new Set<string>();
+    out.tools = req.tools.map((t) => {
+      if (names.has(t.name)) throw new ProtocolError('Duplicate tool name');
+      names.add(t.name);
+      return {
+        type: 'function',
+        name: t.name,
+        ...(t.description !== undefined ? { description: t.description } : {}),
+        parameters: t.input_schema,
+        strict: false,
+      };
+    });
+  }
+  if (req.tool_choice) {
+    const t = req.tool_choice;
+    if ((t.type === 'any' || t.type === 'tool') && !req.tools?.length)
+      throw new ProtocolError('Forced tool choice requires tools');
+    if (t.type === 'tool' && !req.tools?.some((tool) => tool.name === t.name))
+      throw new ProtocolError('tool_choice names an undefined tool');
+    out.tool_choice =
+      t.type === 'tool'
+        ? { type: 'function', name: t.name }
+        : t.type === 'any'
+          ? 'required'
+          : t.type;
+    if ('disable_parallel_tool_use' in t && t.disable_parallel_tool_use !== undefined)
+      out.parallel_tool_calls = !t.disable_parallel_tool_use;
+  }
+  if (req.thinking?.type === 'enabled' && req.thinking.budget_tokens >= req.max_tokens)
+    throw new ProtocolError('thinking budget_tokens must be below max_tokens');
+  if (req.thinking?.type === 'disabled' && req.output_config?.effort)
+    throw new ProtocolError('Cannot combine disabled thinking and reasoning effort');
+  if ((req.thinking && req.thinking.type !== 'disabled') || req.output_config?.effort) {
+    const budget = req.thinking?.type === 'enabled' ? req.thinking.budget_tokens : undefined;
+    out.reasoning = {
+      effort:
+        req.output_config?.effort === 'max'
+          ? 'xhigh'
+          : (req.output_config?.effort ??
+            (budget === undefined
+              ? 'medium'
+              : budget < 2048
+                ? 'low'
+                : budget < 8192
+                  ? 'medium'
+                  : 'high')),
+      summary: 'auto',
+    };
+  }
+  if (req.output_config?.format) {
+    const f = req.output_config.format;
+    if (f.type !== 'json_schema' || !f.schema)
+      throw new ProtocolError('Only json_schema output format is supported');
+    out.text = {
+      format: { type: 'json_schema', name: 'response', schema: f.schema, strict: true },
+    };
+  }
+  if (req.metadata?.user_id) out.safety_identifier = req.metadata.user_id;
+  return out;
+}
+export function outputBlocks(value: unknown): Block[] {
+  const item = record(value);
+  if (item.type === 'reasoning') {
+    const parsed = reasoningSchema.safeParse(item);
+    if (!parsed.success) return upstreamError('Invalid upstream reasoning item');
+    return [reasoningToBlock(parsed.data)];
+  }
+  if (item.type === 'function_call') {
+    let args: unknown;
+    try {
+      args = JSON.parse(string(item.arguments, 'function arguments'));
+    } catch {
+      return upstreamError('Invalid function call JSON');
+    }
+    if (!args || typeof args !== 'object' || Array.isArray(args))
+      return upstreamError('Function call arguments must be an object');
+    return [
+      {
+        type: 'tool_use',
+        id: string(item.call_id, 'call_id'),
+        name: string(item.name, 'function name'),
+        input: args as JsonObject,
+      },
+    ];
+  }
+  if (item.type === 'message') {
+    if (item.role !== 'assistant' || !Array.isArray(item.content))
+      return upstreamError('Invalid upstream assistant message');
+    const blocks: Block[] = item.content.map((p) => {
+      const part = record(p);
+      if (part.type === 'output_text') {
+        if (
+          part.annotations !== undefined &&
+          (!Array.isArray(part.annotations) || part.annotations.length)
+        )
+          return upstreamError('Upstream output annotations cannot be translated');
+        return { type: 'text', text: string(part.text, 'output text') };
+      }
+      if (part.type === 'refusal') return { type: 'text', text: string(part.refusal, 'refusal') };
+      return upstreamError(`Unsupported upstream content type: ${part.type}`);
+    });
+    if (item.phase !== undefined) blocks.push(messageEnvelope(item));
+    return blocks;
+  }
+  return upstreamError(`Unsupported upstream output type: ${item.type}`);
+}
+export function usage(value: unknown): JsonObject {
+  if (value === undefined || value === null) return { input_tokens: 0, output_tokens: 0 };
+  const u = record(value);
+  const count = (v: unknown) => {
+    if (typeof v !== 'number' || !Number.isSafeInteger(v) || v < 0)
+      return upstreamError('Invalid upstream token usage');
+    return v;
+  };
+  const cached = u.input_tokens_details
+    ? count(record(u.input_tokens_details).cached_tokens ?? 0)
+    : 0;
+  const total = count(u.input_tokens ?? 0);
+  if (cached > total) return upstreamError('Cached tokens exceed input tokens');
+  return {
+    input_tokens: total - cached,
+    output_tokens: count(u.output_tokens ?? 0),
+    cache_read_input_tokens: cached,
+    cache_creation_input_tokens: 0,
+  };
+}
+export function toMessage(value: unknown, model: string): JsonObject {
+  const response = record(value);
+  if (!Array.isArray(response.output))
+    return upstreamError('Upstream response has no output array');
+  if (response.status === 'failed' || response.error)
+    return upstreamError('Upstream Responses generation failed');
+  if (response.status !== 'completed' && response.status !== 'incomplete')
+    return upstreamError('Upstream response is not terminal');
+  const content = response.output.flatMap(outputBlocks);
+  let stop = 'end_turn';
+  if (response.status === 'incomplete') {
+    const reason = record(response.incomplete_details).reason;
+    if (reason === 'max_output_tokens') stop = 'max_tokens';
+    else if (reason === 'content_filter') stop = 'refusal';
+    else return upstreamError(`Unsupported incomplete reason: ${reason}`);
+  } else if (content.some((b) => b.type === 'tool_use')) stop = 'tool_use';
+  else if (
+    response.output.some((v) => {
+      const i = record(v);
+      return (
+        i.type === 'message' &&
+        Array.isArray(i.content) &&
+        i.content.some((p) => record(p).type === 'refusal')
+      );
+    })
+  )
+    stop = 'refusal';
+  return {
+    id: string(response.id, 'response id'),
+    type: 'message',
+    role: 'assistant',
+    model,
+    content,
+    stop_reason: stop,
+    stop_sequence: null,
+    usage: usage(response.usage),
+  };
+}

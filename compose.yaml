@@ -1,0 +1,18 @@
+services:
+  gateway:
+    build: .
+    restart: unless-stopped
+    ports:
+      - '127.0.0.1:4000:4000'
+    environment:
+      HOST: 0.0.0.0
+      UPSTREAM_URL: ${UPSTREAM_URL:?Set UPSTREAM_URL in .env}
+      UPSTREAM_API_KEY: ${UPSTREAM_API_KEY:?Set UPSTREAM_API_KEY in .env}
+      GATEWAY_API_KEY: ${GATEWAY_API_KEY:?Set GATEWAY_API_KEY in .env}
+      UPSTREAM_TIMEOUT_MS: ${UPSTREAM_TIMEOUT_MS:-600000}
+    init: true
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
