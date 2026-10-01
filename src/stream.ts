@@ -434,5 +434,25 @@ export async function* translateStream(
   model: string,
   maxStreamBytes = 128 * 1024 * 1024,
 ): AsyncGenerator<JsonObject> {
-  yield* translateOrderedStream(orderedEvents(events, maxStreamBytes), model);
+  // Claude clients consume one content block at a time. Responses can start
+  // another part before output_item.done closes the preceding part.
+  let active: number | undefined;
+  const pending: JsonObject[] = [];
+  function* dispatch(event: JsonObject): Generator<JsonObject> {
+    if (event.type === 'content_block_start') active = event.index as number;
+    yield event;
+    if (event.type === 'content_block_stop') active = undefined;
+  }
+  for await (const event of translateOrderedStream(orderedEvents(events, maxStreamBytes), model)) {
+    if (typeof event.index === 'number' && active !== undefined && event.index !== active) {
+      pending.push(event);
+      continue;
+    }
+    yield* dispatch(event);
+    while (pending.length && (active === undefined || pending[0]!.index === active)) {
+      yield* dispatch(pending.shift()!);
+    }
+  }
+  if (pending.length || active !== undefined)
+    return upstreamError('Stream ended with an unfinished content block');
 }

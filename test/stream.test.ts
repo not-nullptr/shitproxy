@@ -801,3 +801,99 @@ it('upstream encrypted state from added is never replayed prematurely', async ()
   );
   expect(assemble(events)).toEqual(toMessage(complete([final]).response, 'exact/model'));
 });
+
+describe('Claude content block sequencing', () => {
+  it('closes every block before opening the next, including reasoning and multi-part answers', async () => {
+    const reasoning = {
+      type: 'reasoning',
+      id: 'rs_order',
+      summary: [{ type: 'summary_text', text: 'Let me check.' }],
+      encrypted_content: 'cipher',
+    };
+    const answer = {
+      ...textItem,
+      content: [
+        { type: 'output_text', text: 'Yes, it looks like something' },
+        { type: 'output_text', text: ' is off. Here is the answer.' },
+      ],
+    };
+    const events = await run([
+      created,
+      added({ ...reasoning, summary: [] }),
+      {
+        type: 'response.reasoning_summary_text.delta',
+        output_index: 0,
+        item_id: 'rs_order',
+        summary_index: 0,
+        delta: 'Let me check.',
+      },
+      done(reasoning),
+      added({ ...answer, content: [] }, 1),
+      {
+        type: 'response.output_text.delta',
+        output_index: 1,
+        item_id: 'msg_1',
+        content_index: 0,
+        delta: 'Yes, it looks like something',
+      },
+      {
+        type: 'response.output_text.delta',
+        output_index: 1,
+        item_id: 'msg_1',
+        content_index: 1,
+        delta: ' is off. Here is the answer.',
+      },
+      done(answer, 1),
+      complete([reasoning, answer]),
+    ]);
+    let active: unknown = undefined;
+    for (const event of events) {
+      if (event.type === 'content_block_start') {
+        expect(active).toBeUndefined();
+        active = event.index;
+      }
+      if (event.type === 'content_block_delta') expect(event.index).toBe(active);
+      if (event.type === 'content_block_stop') {
+        expect(event.index).toBe(active);
+        active = undefined;
+      }
+    }
+    expect(active).toBeUndefined();
+    expect(assemble(events)).toEqual(
+      toMessage(complete([reasoning, answer]).response, 'exact/model'),
+    );
+  });
+  it('preserves final snapshot suffixes before releasing later text parts', async () => {
+    const answer = {
+      ...textItem,
+      content: [
+        { type: 'output_text', text: 'first complete' },
+        { type: 'output_text', text: 'second complete' },
+      ],
+    };
+    const events = await run([
+      created,
+      added({ ...answer, content: [] }),
+      {
+        type: 'response.output_text.delta',
+        output_index: 0,
+        item_id: 'msg_1',
+        content_index: 0,
+        delta: 'first',
+      },
+      {
+        type: 'response.output_text.delta',
+        output_index: 0,
+        item_id: 'msg_1',
+        content_index: 1,
+        delta: 'second',
+      },
+      done(answer),
+      complete([answer]),
+    ]);
+    const firstStop = events.findIndex((e) => e.type === 'content_block_stop' && e.index === 0);
+    const secondStart = events.findIndex((e) => e.type === 'content_block_start' && e.index === 1);
+    expect(firstStop).toBeLessThan(secondStart);
+    expect(assemble(events)).toEqual(toMessage(complete([answer]).response, 'exact/model'));
+  });
+});
