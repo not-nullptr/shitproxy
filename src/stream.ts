@@ -7,6 +7,7 @@ import {
   type JsonObject,
 } from './protocol.js';
 import { outputBlocks, toMessage } from './translate.js';
+import { repairAnswerPrefix } from './answer-prefix.js';
 
 export type SseEvent = { event?: string; data: string };
 export async function* parseSse(
@@ -429,7 +430,7 @@ async function* orderedEvents(
     yield* drain();
   }
 }
-export async function* translateStream(
+async function* translateSerializedStream(
   events: AsyncIterable<SseEvent>,
   model: string,
   maxStreamBytes = 128 * 1024 * 1024,
@@ -455,4 +456,12 @@ export async function* translateStream(
   }
   if (pending.length || active !== undefined)
     return upstreamError('Stream ended with an unfinished content block');
+}
+
+export async function* translateStream(
+  events: AsyncIterable<SseEvent>,
+  model: string,
+  maxStreamBytes = 128 * 1024 * 1024,
+): AsyncGenerator<JsonObject> {
+  yield* repairAnswerPrefix(translateSerializedStream(events, model, maxStreamBytes));
 }

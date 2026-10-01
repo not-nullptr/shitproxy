@@ -897,3 +897,75 @@ describe('Claude content block sequencing', () => {
     expect(assemble(events)).toEqual(toMessage(complete([answer]).response, 'exact/model'));
   });
 });
+
+it.each([undefined, 'final_answer', 'commentary', null])(
+  'repairs GLM interleaving and replays state with phase %s',
+  async (phase) => {
+    const { toResponses } = await import('../src/translate.js');
+    const r0 = {
+      type: 'reasoning',
+      id: 'r0',
+      summary: [],
+      content: [{ type: 'reasoning_text', text: 'Thinking' }],
+      encrypted_content: 'opaque-0',
+    };
+    const a = {
+      type: 'message',
+      id: 'a',
+      role: 'assistant',
+      content: [{ type: 'output_text', text: 'Yes — it', annotations: [] }],
+    };
+    const r1 = {
+      type: 'reasoning',
+      id: 'r1',
+      summary: [],
+      content: [{ type: 'reasoning_text', text: '.' }],
+      encrypted_content: 'opaque-1',
+    };
+    const b = {
+      type: 'message',
+      id: 'b',
+      role: 'assistant',
+      status: 'completed',
+      ...(phase !== undefined ? { phase } : {}),
+      content: [{ type: 'output_text', text: ' looks like it.', annotations: [] }],
+    };
+    const events = await run([
+      created,
+      added(r0),
+      done(r0),
+      added(a, 1),
+      done(a, 1),
+      added(r1, 2),
+      done(r1, 2),
+      added(b, 3),
+      done(b, 3),
+      complete([r0, a, r1, b]),
+    ]);
+    const message = assemble(events);
+    expect(message.content.filter((b: any) => b.type === 'text')).toEqual([
+      { type: 'text', text: 'Yes — it looks like it.' },
+    ]);
+    let active: unknown;
+    for (const e of events) {
+      if (e.type === 'content_block_start') {
+        expect(active).toBeUndefined();
+        active = e.index;
+      }
+      if (e.type === 'content_block_delta') expect(e.index).toBe(active);
+      if (e.type === 'content_block_stop') {
+        expect(e.index).toBe(active);
+        active = undefined;
+      }
+    }
+    expect(active).toBeUndefined();
+    const replay = toResponses({
+      model: 'exact/model',
+      max_tokens: 100,
+      messages: [{ role: 'assistant', content: message.content }],
+    });
+    expect((replay.input as any[]).slice(0, 2)).toEqual([r0, r1]);
+    expect((replay.input as any[])[2].content[0].text).toBe('Yes — it looks like it.');
+    if (phase !== undefined) expect((replay.input as any[])[2].phase).toBe(phase);
+  },
+);

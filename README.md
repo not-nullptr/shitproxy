@@ -94,6 +94,8 @@ On the translated path, unsupported blocks/tools/fields return an explicit 400: 
 
 Parallel upstream output items are buffered in output order to keep encrypted reasoning before tool calls. Out-of-order parts _inside one message/reasoning item_ fail explicitly. Truncated streams emit an Anthropic `error` event and do not emit `message_stop`. Terminal snapshots fill in missing deltas and routers that omit `output_item.done`; snapshots that contradict streamed content fail.
 
+Translated streams also hold the opening answer after reasoning until it reaches 16 Unicode characters, generation ends, a tool/phase barrier appears, or 200 ms elapses. This repairs compatible routers that emit a tiny answer prefix before their final reasoning fragment: the late reasoning streams immediately, then the prefix and continuing answer form one text block. If the timer expires during an active reasoning block, release waits for that block to close so Anthropic blocks never overlap. After release, answer deltas stream normally; there is no whole-response wait. Reasoning arriving after release remains in its original order and may still display separately. Native Anthropic streams are unaffected. Reasoning envelopes retain each original item; a repaired answer's phase metadata retains its identity, phase and status with the joined visible answer text.
+
 ## Operational behavior
 
 - Separate client and upstream credentials: `GATEWAY_API_KEY` checks ingress, `UPSTREAM_API_KEY` overrides upstream auth. Without a configured upstream key, caller auth is forwarded (for local pass-through setups). Always set both keys for the shared-key Compose deployment.
