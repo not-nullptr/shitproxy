@@ -54,6 +54,6 @@ export function visibleMessageParts(message: ReplayMessage) {
   return message.content.map((p) => ({
     type: 'output_text',
     text: p.type === 'output_text' ? p.text : p.refusal,
-    annotations: [],
+    annotations: p.type === 'output_text' ? (p.annotations ?? []) : [],
   }));
 }

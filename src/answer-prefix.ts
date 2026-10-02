@@ -1,4 +1,5 @@
 import type { JsonObject } from './protocol.js';
+import { shiftCitation } from './web-search.js';
 import { messageEnvelope, replayMessage } from './message-state.js';
 
 /** Repair a short answer prefix overtaking the last reasoning fragment.
@@ -20,6 +21,8 @@ export async function* repairAnswerPrefix(
     repaired = false;
   let mergedText: number | undefined;
   let mergedValue = '';
+  const textOffsets = new Map<number, number>();
+  let mergedCitations: JsonObject[] = [];
   let activeReasoning: number | undefined,
     expired = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -35,6 +38,7 @@ export async function* repairAnswerPrefix(
       yield { type: 'content_block_stop', index: mergedText };
       mergedText = undefined;
       mergedValue = '';
+      mergedCitations = [];
     }
   }
   function* emit(event: JsonObject): Generator<JsonObject> {
@@ -50,11 +54,12 @@ export async function* repairAnswerPrefix(
         const original = replayMessage(block.data as string);
         block = messageEnvelope({
           ...original,
-          content: [{ type: 'output_text', text: mergedValue, annotations: [] }],
+          content: [{ type: 'output_text', text: mergedValue, annotations: mergedCitations }],
         }) as JsonObject;
         event = { ...event, content_block: block };
       }
       if (block.type === 'text' && repaired) {
+        textOffsets.set(event.index as number, mergedValue.length);
         if (mergedText !== undefined) {
           indexes.set(event.index as number, mergedText);
           return;
@@ -66,7 +71,14 @@ export async function* repairAnswerPrefix(
     if (event.type === 'message_delta' || event.type === 'message_stop') yield* closeMerged();
     if (typeof event.index === 'number') {
       const index = indexes.get(event.index)!;
-      const delta = event.delta as JsonObject | undefined;
+      let delta = event.delta as JsonObject | undefined;
+      if (index === mergedText && delta?.type === 'citations_delta') {
+        const citation = shiftCitation(delta.citation, textOffsets.get(event.index) ?? 0);
+        delta = { ...delta, citation };
+        event = { ...event, delta };
+        const encoded = String(citation.encrypted_index).slice('spx:citation:v1:'.length);
+        mergedCitations.push(JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8')));
+      }
       if (index === mergedText && delta?.type === 'text_delta') mergedValue += delta.text;
       if (event.type === 'content_block_stop' && index === mergedText) return;
       yield { ...event, index };
@@ -102,7 +114,9 @@ export async function* repairAnswerPrefix(
         const block = event.content_block as JsonObject;
         if (
           block.type === 'thinking' ||
-          (block.type === 'redacted_thinking' && !String(block.data).startsWith('spx:message:'))
+          (block.type === 'redacted_thinking' &&
+            !String(block.data).startsWith('spx:message:') &&
+            !String(block.data).startsWith('spx:websearch:'))
         ) {
           thinkingSeen = true;
           activeReasoning = event.index as number;

@@ -16,14 +16,24 @@ import {
   type MessagesRequest,
 } from './protocol.js';
 import { blockToReasoning, reasoningToBlock } from './reasoning.js';
+import {
+  citations,
+  replayCitations,
+  hasSearchEnvelope,
+  replaySearch,
+  searchBlocks,
+} from './web-search.js';
 export function inputPart(
   block: Extract<Block, { type: 'text' | 'image' }>,
   role: 'user' | 'assistant' | 'system' | 'developer' = 'user',
 ): JsonObject {
-  if (block.type === 'text')
+  if (block.type === 'text') {
+    if (role !== 'assistant' && block.citations !== undefined)
+      throw new ProtocolError('Citations require assistant role');
     return role === 'assistant'
-      ? { type: 'output_text', text: block.text, annotations: [] }
+      ? { type: 'output_text', text: block.text, annotations: replayCitations(block) }
       : { type: 'input_text', text: block.text };
+  }
   if (role !== 'user')
     throw new ProtocolError('Image content requires user role on the Responses path');
   const src = block.source;
@@ -39,6 +49,8 @@ export function toResponses(value: unknown): JsonObject {
   if (req.top_k !== undefined) throw new ProtocolError('top_k has no Responses equivalent');
   if (req.stop_sequences?.length)
     throw new ProtocolError('stop_sequences has no Responses equivalent');
+  if (Array.isArray(req.system) && req.system.some((b) => b.citations !== undefined))
+    throw new ProtocolError('Citations require assistant role');
   const input: JsonObject[] = [];
   if (req.system !== undefined)
     input.push({
@@ -53,6 +65,15 @@ export function toResponses(value: unknown): JsonObject {
     });
   const calls = new Set<string>(),
     results = new Set<string>();
+  const searches = new Map<
+    string,
+    {
+      block: Extract<Block, { type: 'server_tool_use' }>;
+      index: number;
+      replayed?: boolean;
+      results?: Extract<Block, { type: 'web_search_tool_result' }>;
+    }
+  >();
   for (const message of req.messages) {
     const blocks: Block[] =
       typeof message.content === 'string'
@@ -70,6 +91,23 @@ export function toResponses(value: unknown): JsonObject {
         content.push(inputPart(block, message.role));
         continue;
       }
+      if (block.type === 'redacted_thinking' && hasSearchEnvelope(block)) {
+        if (message.role !== 'assistant')
+          throw new ProtocolError('Web search history requires assistant role');
+        const replay = replaySearch(block.data),
+          previous = searches.get(replay.id as string);
+        if (!previous?.results || previous.replayed)
+          throw new ProtocolError('Web search metadata has no preceding search/result pair');
+        const expected = searchBlocks(replay);
+        if (
+          JSON.stringify([previous.block, previous.results]) !==
+          JSON.stringify(expected.slice(0, 2))
+        )
+          throw new ProtocolError('Web search history was modified after translation');
+        previous.replayed = true;
+        input[previous.index] = replay;
+        continue;
+      }
       if (hasMessageEnvelope(block)) {
         if (message.role !== 'assistant')
           throw new ProtocolError('Assistant message metadata requires assistant role');
@@ -83,10 +121,38 @@ export function toResponses(value: unknown): JsonObject {
         continue;
       }
       flush();
-      if (block.type === 'tool_use') {
+      if (block.type === 'server_tool_use') {
+        if (message.role !== 'assistant')
+          throw new ProtocolError('Web search history requires assistant role');
+        if (searches.has(block.id) || calls.has(block.id))
+          throw new ProtocolError('Duplicate tool call ID');
+        if (typeof block.input.query !== 'string' && Object.keys(block.input).length !== 0)
+          throw new ProtocolError('Web search history requires a query');
+        searches.set(block.id, { block, index: input.length });
+        input.push({
+          type: 'web_search_call',
+          id: block.id,
+          status: 'completed',
+          action: { type: 'search', query: block.input.query ?? '', sources: [] },
+        });
+      } else if (block.type === 'web_search_tool_result') {
+        const previous = searches.get(block.tool_use_id);
+        if (message.role !== 'assistant' || !previous || previous.results)
+          throw new ProtocolError('Invalid web search result history');
+        previous.results = block;
+        const item = input[previous.index]!;
+        if (Array.isArray(block.content))
+          record(item.action).sources = block.content.map((s) => ({
+            type: 'url',
+            url: s.url,
+            title: s.title,
+          }));
+        else item.status = 'failed';
+      } else if (block.type === 'tool_use') {
         if (message.role !== 'assistant')
           throw new ProtocolError('tool_use requires assistant role');
-        if (calls.has(block.id)) throw new ProtocolError('Duplicate tool call ID');
+        if (calls.has(block.id) || searches.has(block.id))
+          throw new ProtocolError('Duplicate tool call ID');
         calls.add(block.id);
         input.push({
           type: 'function_call',
@@ -118,6 +184,8 @@ export function toResponses(value: unknown): JsonObject {
     }
     flush();
   }
+  for (const search of searches.values())
+    if (!search.results) throw new ProtocolError('Web search history has no result');
   const out: JsonObject = {
     model: req.model,
     input,
@@ -133,6 +201,24 @@ export function toResponses(value: unknown): JsonObject {
     out.tools = req.tools.map((t) => {
       if (names.has(t.name)) throw new ProtocolError('Duplicate tool name');
       names.add(t.name);
+      if ('type' in t) {
+        if (t.allowed_domains !== undefined && t.blocked_domains !== undefined)
+          throw new ProtocolError(
+            'Web search accepts allowed_domains or blocked_domains, not both',
+          );
+        if (t.max_uses !== undefined) out.max_tool_calls = t.max_uses;
+        (out.include as string[]).push('web_search_call.action.sources');
+        return {
+          type: 'web_search',
+          ...(t.user_location && { user_location: t.user_location }),
+          ...((t.allowed_domains || t.blocked_domains) && {
+            filters: {
+              ...(t.allowed_domains && { allowed_domains: t.allowed_domains }),
+              ...(t.blocked_domains && { blocked_domains: t.blocked_domains }),
+            },
+          }),
+        };
+      }
       return {
         type: 'function',
         name: t.name,
@@ -150,7 +236,9 @@ export function toResponses(value: unknown): JsonObject {
       throw new ProtocolError('tool_choice names an undefined tool');
     out.tool_choice =
       t.type === 'tool'
-        ? { type: 'function', name: t.name }
+        ? req.tools?.some((tool) => tool.name === t.name && 'type' in tool)
+          ? { type: 'web_search' }
+          : { type: 'function', name: t.name }
         : t.type === 'any'
           ? 'required'
           : t.type;
@@ -191,6 +279,7 @@ export function toResponses(value: unknown): JsonObject {
 }
 export function outputBlocks(value: unknown): Block[] {
   const item = record(value);
+  if (item.type === 'web_search_call') return searchBlocks(item);
   if (item.type === 'reasoning') {
     const parsed = reasoningSchema.safeParse(item);
     if (!parsed.success) return upstreamError('Invalid upstream reasoning item');
@@ -220,12 +309,9 @@ export function outputBlocks(value: unknown): Block[] {
     const blocks: Block[] = item.content.map((p) => {
       const part = record(p);
       if (part.type === 'output_text') {
-        if (
-          part.annotations !== undefined &&
-          (!Array.isArray(part.annotations) || part.annotations.length)
-        )
-          return upstreamError('Upstream output annotations cannot be translated');
-        return { type: 'text', text: string(part.text, 'output text') };
+        const text = string(part.text, 'output text'),
+          refs = citations(part.annotations, text);
+        return { type: 'text', text, ...(refs?.length && { citations: refs }) };
       }
       if (part.type === 'refusal') return { type: 'text', text: string(part.refusal, 'refusal') };
       return upstreamError(`Unsupported upstream content type: ${part.type}`);

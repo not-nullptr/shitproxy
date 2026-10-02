@@ -71,7 +71,7 @@ export function sse(event: JsonObject): string {
 type Part = {
   index: number;
   text: string;
-  kind: 'text' | 'thinking' | 'tool_use';
+  kind: 'text' | 'thinking' | 'tool_use' | 'server_tool_use';
   closed: boolean;
 };
 type State = {
@@ -120,7 +120,7 @@ async function* translateOrderedStream(
       type: 'content_block_delta',
       index: part.index,
       delta:
-        part.kind === 'tool_use'
+        part.kind === 'tool_use' || part.kind === 'server_tool_use'
           ? { type: 'input_json_delta', partial_json: text }
           : part.kind === 'thinking'
             ? { type: 'thinking_delta', thinking: text }
@@ -137,13 +137,23 @@ async function* translateOrderedStream(
     for (let i = 0; i < blocks.length; i++) {
       const block = blocks[i]!;
       let part = state.parts.get(i);
+      if (block.type === 'web_search_tool_result') {
+        yield { type: 'content_block_start', index: nextIndex, content_block: block };
+        yield { type: 'content_block_stop', index: nextIndex++ };
+        continue;
+      }
       if (block.type === 'redacted_thinking') {
         if (part) return upstreamError('Reasoning summary disappeared at completion');
         yield { type: 'content_block_start', index: nextIndex, content_block: block };
         yield { type: 'content_block_stop', index: nextIndex++ };
         continue;
       }
-      if (block.type !== 'text' && block.type !== 'thinking' && block.type !== 'tool_use')
+      if (
+        block.type !== 'text' &&
+        block.type !== 'thinking' &&
+        block.type !== 'tool_use' &&
+        block.type !== 'server_tool_use'
+      )
         return upstreamError('Unsupported stream block');
       const kind = block.type;
       if (!part) {
@@ -154,12 +164,19 @@ async function* translateOrderedStream(
             ? { type: 'text', text: '' }
             : kind === 'thinking'
               ? { type: 'thinking', thinking: '', signature: '' }
-              : {
-                  type: 'tool_use',
-                  id: (block as Extract<Block, { type: 'tool_use' }>).id,
-                  name: (block as Extract<Block, { type: 'tool_use' }>).name,
-                  input: {},
-                },
+              : kind === 'server_tool_use'
+                ? {
+                    type: 'server_tool_use',
+                    id: (block as Extract<Block, { type: 'server_tool_use' }>).id,
+                    name: 'web_search',
+                    input: {},
+                  }
+                : {
+                    type: 'tool_use',
+                    id: (block as Extract<Block, { type: 'tool_use' | 'server_tool_use' }>).id,
+                    name: (block as Extract<Block, { type: 'tool_use' | 'server_tool_use' }>).name,
+                    input: {},
+                  },
           kind,
         );
         part = state.parts.get(i)!;
@@ -175,11 +192,20 @@ async function* translateOrderedStream(
           ? block.text
           : block.type === 'thinking'
             ? block.thinking
-            : string(record(item).arguments, 'arguments');
+            : block.type === 'server_tool_use'
+              ? JSON.stringify(block.input)
+              : string(record(item).arguments, 'arguments');
       if (!full.startsWith(part.text))
         return upstreamError('Final output disagrees with streamed deltas');
       const tail = full.slice(part.text.length);
       if (tail) yield delta(part, tail);
+      if (block.type === 'text')
+        for (const citation of block.citations ?? [])
+          yield {
+            type: 'content_block_delta',
+            index: part.index,
+            delta: { type: 'citations_delta', citation },
+          };
       if (block.type === 'thinking')
         yield {
           type: 'content_block_delta',
@@ -267,6 +293,18 @@ async function* translateOrderedStream(
           },
           'tool_use',
         );
+      else if (item.type === 'web_search_call')
+        yield open(
+          state,
+          0,
+          {
+            type: 'server_tool_use',
+            id: string(item.id, 'search ID'),
+            name: 'web_search',
+            input: {},
+          },
+          'server_tool_use',
+        );
       else if (item.type !== 'message' && item.type !== 'reasoning')
         return upstreamError(`Unsupported streaming output item: ${item.type}`);
       continue;
@@ -329,6 +367,10 @@ async function* translateOrderedStream(
     // These lifecycle events carry redundant snapshots; output_item.done is authoritative.
     if (
       [
+        'response.output_text.annotation.added',
+        'response.web_search_call.in_progress',
+        'response.web_search_call.searching',
+        'response.web_search_call.completed',
         'response.content_part.added',
         'response.content_part.done',
         'response.output_text.done',

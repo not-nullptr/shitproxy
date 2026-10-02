@@ -90,7 +90,7 @@ For web-client compatibility, translated message history may include text-only `
 
 The protocols are not identical. `budget_tokens` cannot impose an exact Responses reasoning token budget. A provider can reject unsupported effort, sampling, structured output, image, or reasoning settings; the gateway preserves that failure instead of silently retrying with reduced capabilities.
 
-On the translated path, unsupported blocks/tools/fields return an explicit 400: documents/PDFs, audio/video, native server tools (web search/computer use), citations in request history, context-management controls, top_k, nonempty stop_sequences, and assistant image history. Unknown upstream output/events and output citation annotations return 502 or an SSE error. Token counting, batches, and other endpoints are not implemented. Native `anthropic/*` messages bypass these translation restrictions.
+On the translated path, unsupported blocks/tools/fields return an explicit 400: documents/PDFs, audio/video, native server tools other than basic web search (including computer use and dynamic-filtering search), native Anthropic citation tokens in translated history, context-management controls, top_k, nonempty stop_sequences, and assistant image history. Unknown upstream output/events and unsupported output annotations return 502 or an SSE error. Token counting, batches, and other endpoints are not implemented. Native `anthropic/*` messages bypass these translation restrictions.
 
 Parallel upstream output items are buffered in output order to keep encrypted reasoning before tool calls. Out-of-order parts _inside one message/reasoning item_ fail explicitly. Truncated streams emit an Anthropic `error` event and do not emit `message_stop`. Terminal snapshots fill in missing deltas and routers that omit `output_item.done`; snapshots that contradict streamed content fail.
 
@@ -118,3 +118,11 @@ Coverage thresholds are enforced in CI (90% lines/statements/functions; 85% bran
 These are local tests against controlled upstreams, not evidence that your specific router and Claude UI work together. Before trusting it for real agent loops, run a text request, streaming request, image request, parallel tool call, and multi-turn reasoning/tool replay against your actual upstream. No live provider credentials are needed for the automated suite.
 
 Protocol references: [Anthropic Messages](https://platform.claude.com/docs/en/api/http/messages), [Anthropic streaming](https://platform.claude.com/docs/en/build-with-claude/streaming), [Responses reasoning](https://developers.openai.com/api/docs/guides/reasoning), [Responses streaming events](https://developers.openai.com/api/reference/resources/responses/streaming-events).
+
+## Hosted web search translation
+
+On the Responses route, Anthropic `web_search_20250305` with name `web_search` becomes OpenAI `{ "type": "web_search" }`. This requires an upstream that implements hosted Responses web search; declaring the tool does not provide a search backend. Native Anthropic routes remain passthrough. Later dynamic-filtering search versions are explicitly rejected.
+
+Allowed or blocked domains, approximate user location, forced tool choice, search sources, URL citations, and assistant search history are translated. Search calls stream immediately; results and citation deltas arrive when supplied by the upstream. Opaque proxy metadata preserves original search items and citation offsets for replay. These locally encoded tokens are replay metadata, not provider-encrypted search content.
+
+`max_uses` maps to Responses `max_tool_calls`. The latter counts all built-in tool actions (including opening/finding pages) and ignores calls above the limit, so it cannot reproduce Anthropic's search-only limit and `max_uses_exceeded` result exactly.

@@ -11,7 +11,23 @@ export class ProtocolError extends Error {
 }
 export const object = z.record(z.string(), z.unknown());
 const cache = { cache_control: object.optional() };
-const text = z.object({ type: z.literal('text'), text: z.string(), ...cache }).strict();
+const webCitation = z
+  .object({
+    type: z.literal('web_search_result_location'),
+    url: z.string(),
+    title: z.string().nullable(),
+    cited_text: z.string(),
+    encrypted_index: z.string(),
+  })
+  .strict();
+const text = z
+  .object({
+    type: z.literal('text'),
+    text: z.string(),
+    citations: z.array(webCitation).optional(),
+    ...cache,
+  })
+  .strict();
 const source = z.discriminatedUnion('type', [
   z
     .object({
@@ -47,7 +63,47 @@ const thinking = z
 const redacted = z
   .object({ type: z.literal('redacted_thinking'), data: z.string().min(1) })
   .strict();
-export const blockSchema = z.union([text, image, toolUse, toolResult, thinking, redacted]);
+const serverToolUse = z
+  .object({
+    type: z.literal('server_tool_use'),
+    id: z.string().min(1),
+    name: z.literal('web_search'),
+    input: object,
+    ...cache,
+  })
+  .strict();
+const searchResult = z
+  .object({
+    type: z.literal('web_search_result'),
+    url: z.string(),
+    title: z.string(),
+    encrypted_content: z.string(),
+    page_age: z.string().nullable().optional(),
+  })
+  .strict();
+const webResult = z
+  .object({
+    type: z.literal('web_search_tool_result'),
+    tool_use_id: z.string().min(1),
+    content: z.union([
+      z.array(searchResult),
+      z
+        .object({ type: z.literal('web_search_tool_result_error'), error_code: z.string() })
+        .strict(),
+    ]),
+    ...cache,
+  })
+  .strict();
+export const blockSchema = z.union([
+  text,
+  image,
+  toolUse,
+  toolResult,
+  thinking,
+  redacted,
+  serverToolUse,
+  webResult,
+]);
 export type Block = z.infer<typeof blockSchema>;
 export const requestSchema = z
   .object({
@@ -67,14 +123,37 @@ export const requestSchema = z
       .min(1),
     tools: z
       .array(
-        z
-          .object({
-            name: z.string().min(1),
-            description: z.string().optional(),
-            input_schema: object,
-            ...cache,
-          })
-          .strict(),
+        z.union([
+          z
+            .object({
+              name: z.string().min(1),
+              description: z.string().optional(),
+              input_schema: object,
+              ...cache,
+            })
+            .strict(),
+          z
+            .object({
+              type: z.literal('web_search_20250305'),
+              name: z.literal('web_search'),
+              max_uses: z.number().int().positive().optional(),
+              allowed_domains: z.array(z.string().min(1)).optional(),
+              blocked_domains: z.array(z.string().min(1)).optional(),
+              user_location: z
+                .object({
+                  type: z.literal('approximate'),
+                  city: z.string().optional(),
+                  region: z.string().optional(),
+                  country: z.string().optional(),
+                  timezone: z.string().optional(),
+                })
+                .strict()
+                .optional(),
+              allowed_callers: z.array(z.literal('direct')).length(1).optional(),
+              ...cache,
+            })
+            .strict(),
+        ]),
       )
       .optional(),
     tool_choice: z
