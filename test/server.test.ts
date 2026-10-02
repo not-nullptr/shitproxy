@@ -66,6 +66,41 @@ async function read(req: IncomingMessage) {
   for await (const chunk of req) chunks.push(chunk);
   return Buffer.concat(chunks).toString('utf8');
 }
+
+describe('translated message identity', () => {
+  it.each([false, true])(
+    'assigns distinct IDs when the router reuses resp_router (stream=%s)',
+    async (stream) => {
+      const upstreamOutput = { ...output, id: 'resp_router' };
+      const { base } = await setup((_req, res) => {
+        if (stream) {
+          res.setHeader('content-type', 'text/event-stream');
+          res.end(
+            sse({ type: 'response.created', response: { id: 'resp_router' } }) +
+              sse({ type: 'response.completed', response: upstreamOutput }),
+          );
+        } else res.end(JSON.stringify(upstreamOutput));
+      });
+      const results = await Promise.all(
+        Array.from({ length: 7 }, async () => {
+          const response = await post(base, { ...request, stream });
+          expect(response.status).toBe(200);
+          if (!stream) return (await response.json()).id;
+          const frames = (await response.text())
+            .split('\n')
+            .filter((line) => line.startsWith('data: '))
+            .map((line) => JSON.parse(line.slice(6)));
+          const starts = frames.filter((frame) => frame.type === 'message_start');
+          expect(starts).toHaveLength(1);
+          expect(frames.at(-1).type).toBe('message_stop');
+          return starts[0].message.id;
+        }),
+      );
+      expect(new Set(results).size).toBe(7);
+      for (const id of results) expect(id).toMatch(/^msg_[a-f0-9]{32}$/);
+    },
+  );
+});
 describe('HTTP routing and protocol integration', () => {
   it('routes all non-Anthropic models to Responses with exact ID', async () => {
     let captured: any;

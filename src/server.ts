@@ -288,6 +288,11 @@ export function createGateway(config: GatewayConfig) {
           kind,
         );
       }
+      // Routers may reuse placeholder response IDs across tool round trips.
+      // Clients use Messages IDs as identity, so each translated response needs
+      // its own ID. Keep upstream IDs unchanged inside the translation engine
+      // for lifecycle validation and reasoning/message replay metadata.
+      const messageId = `msg_${randomUUID().replaceAll('-', '')}`;
       if (translated!.stream) {
         if (
           !upstream.headers.get('content-type')?.includes('text/event-stream') ||
@@ -324,6 +329,7 @@ export function createGateway(config: GatewayConfig) {
           request!.model as string,
           config.maxStreamBytes,
         )) {
+          if (event.type === 'message_start') record(event.message).id = messageId;
           trace('downstream', event);
           await write(res, sse(event));
         }
@@ -333,6 +339,7 @@ export function createGateway(config: GatewayConfig) {
           await responseJson(upstream, config.maxResponseBytes ?? 32 * 1024 * 1024),
           request!.model as string,
         );
+        output.id = messageId;
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify(output));
       }
