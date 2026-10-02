@@ -4,6 +4,13 @@ import { traceShape } from './trace.js';
 import { ProtocolError, record } from './protocol.js';
 import { toResponses, toMessage } from './translate.js';
 import { parseSse, sse, translateStream } from './stream.js';
+import {
+  prepareLocalSearch,
+  replayLocalSearches,
+  LocalSearchLoop,
+  localSearchEvents,
+} from './local-search.js';
+import { createKagiSearcher, type Searcher } from './kagi.js';
 export type GatewayConfig = {
   upstreamUrl: string;
   upstreamApiKey?: string;
@@ -15,6 +22,9 @@ export type GatewayConfig = {
   maxStreamBytes?: number;
   fetch?: typeof fetch;
   debugStream?: boolean;
+  kagiSession?: string;
+  kagiTurnstile?: string;
+  search?: Searcher;
 };
 const HOP = new Set([
   'connection',
@@ -174,6 +184,11 @@ function errorBody(error: ProtocolError) {
 export function createGateway(config: GatewayConfig) {
   const base = upstreamBase(config.upstreamUrl);
   const fetcher = config.fetch ?? fetch;
+  const searcher =
+    config.search ??
+    (config.kagiSession
+      ? createKagiSearcher(config.kagiSession, { turnstile: config.kagiTurnstile })
+      : undefined);
   const limit = config.maxBodyBytes ?? 32 * 1024 * 1024;
   for (const [name, value] of Object.entries({
     timeoutMs: config.timeoutMs ?? 600000,
@@ -240,6 +255,11 @@ export function createGateway(config: GatewayConfig) {
         native = model.startsWith('anthropic/');
       }
       const translated = messages && !native ? toResponses(request) : undefined;
+      const localPlan = translated ? prepareLocalSearch(request!, translated, searcher) : undefined;
+      if (translated) replayLocalSearches(translated, String(request!.model).startsWith('openai/'));
+      const localLoop = localPlan
+        ? new LocalSearchLoop(localPlan, searcher!, controller.signal)
+        : undefined;
       const target = new URL(base);
       target.pathname += models ? '/models' : native ? '/messages' : '/responses';
       target.search = url.search;
@@ -288,6 +308,24 @@ export function createGateway(config: GatewayConfig) {
           kind,
         );
       }
+      const sendContinuation = async (next: Record<string, unknown>) => {
+        const response = await fetcher(target, {
+          method: 'POST',
+          headers: outgoing,
+          body: JSON.stringify(next),
+          signal: controller.signal,
+          redirect: 'manual',
+        });
+        if (!response.ok) {
+          await response.body?.cancel();
+          throw new ProtocolError(
+            `Upstream search continuation returned HTTP ${response.status}`,
+            response.status >= 400 && response.status <= 599 ? response.status : 502,
+            'api_error',
+          );
+        }
+        return response;
+      };
       // Routers may reuse placeholder response IDs across tool round trips.
       // Clients use Messages IDs as identity, so each translated response needs
       // its own ID. Keep upstream IDs unchanged inside the translation engine
@@ -313,7 +351,12 @@ export function createGateway(config: GatewayConfig) {
         res.flushHeaders();
         translatedStream = true;
         async function* tracedUpstream() {
-          for await (const frame of parseSse(upstream.body!, config.maxSseFrameBytes)) {
+          for await (const frame of localLoop
+            ? localSearchEvents(upstream, localLoop, sendContinuation, {
+                maxFrameBytes: config.maxSseFrameBytes,
+                maxBytes: config.maxStreamBytes,
+              })
+            : parseSse(upstream.body!, config.maxSseFrameBytes)) {
             if (traceId) {
               try {
                 trace('upstream', JSON.parse(frame.data));
@@ -335,10 +378,32 @@ export function createGateway(config: GatewayConfig) {
         }
         res.end();
       } else {
-        const output = toMessage(
+        let response = record(
           await responseJson(upstream, config.maxResponseBytes ?? 32 * 1024 * 1024),
-          request!.model as string,
         );
+        if (localLoop) {
+          let remainingJson =
+            (config.maxResponseBytes ?? 32 * 1024 * 1024) -
+            Buffer.byteLength(JSON.stringify(response));
+          while (true) {
+            const result = await localLoop.json(response);
+            if (!result.next) {
+              response = result.response;
+              break;
+            }
+            if (remainingJson <= 0)
+              throw new ProtocolError(
+                'Search responses exceed configured size limit',
+                502,
+                'api_error',
+              );
+            response = record(
+              await responseJson(await sendContinuation(result.next), remainingJson),
+            );
+            remainingJson -= Buffer.byteLength(JSON.stringify(response));
+          }
+        }
+        const output = toMessage(response, request!.model as string);
         output.id = messageId;
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify(output));

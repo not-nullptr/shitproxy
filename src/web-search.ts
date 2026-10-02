@@ -84,7 +84,14 @@ export function searchBlocks(value: unknown): Block[] {
               title: s.title ?? s.url,
               encrypted_content: encode(PREFIX, s),
             }))
-          : { type: 'web_search_tool_result_error', error_code: 'unavailable' },
+          : {
+              type: 'web_search_tool_result_error',
+              error_code: ['invalid_input', 'max_uses_exceeded', 'unavailable'].includes(
+                String(item.spx_error),
+              )
+                ? String(item.spx_error)
+                : 'unavailable',
+            },
     },
     { type: 'redacted_thinking', data: encode(PREFIX, item) },
   ];

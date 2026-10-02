@@ -111,7 +111,7 @@ Translated streams also hold the opening answer after reasoning until it reaches
 npm run test:coverage
 ```
 
-Tests cover exact routing, native request bytes and SSE, tool/result ordering, parallel subagents, reasoning signatures and opaque ciphertext, a 100-turn tool loop, malformed inputs, HTTP failures, auth, deadlines, disconnects, slow readers, and SSE splits at every byte boundary. Seeded property tests run 1,300 additional generated examples for JSON arguments, reasoning envelopes, and Unicode/chunked streams.
+Tests cover exact routing, native request bytes and SSE, tool/result ordering, parallel subagents, reasoning signatures and opaque ciphertext, a 100-turn tool loop, malformed inputs, HTTP failures, auth, deadlines, disconnects, slow readers, and SSE splits at every byte boundary. Seeded property tests run 1,400 additional generated examples for JSON arguments, reasoning envelopes, and Unicode/chunked streams.
 
 Coverage thresholds are enforced in CI (90% lines/statements/functions; 85% branches). HTML coverage is written to `coverage/index.html`. CI checks Node 22 and 24 and builds the Docker image.
 
@@ -119,10 +119,20 @@ These are local tests against controlled upstreams, not evidence that your speci
 
 Protocol references: [Anthropic Messages](https://platform.claude.com/docs/en/api/http/messages), [Anthropic streaming](https://platform.claude.com/docs/en/build-with-claude/streaming), [Responses reasoning](https://developers.openai.com/api/docs/guides/reasoning), [Responses streaming events](https://developers.openai.com/api/reference/resources/responses/streaming-events).
 
-## Hosted web search translation
+## Web search
 
-On the Responses route, Anthropic `web_search_20250305` with name `web_search` becomes OpenAI `{ "type": "web_search" }`. This requires an upstream that implements hosted Responses web search; declaring the tool does not provide a search backend. Native Anthropic routes remain passthrough. Later dynamic-filtering search versions are explicitly rejected.
+Search routing applies only when the request declares Anthropic `web_search_20250305` with name `web_search`. An ordinary function named `web_search` remains a client tool and is never intercepted.
 
-Allowed or blocked domains, approximate user location, forced tool choice, search sources, URL citations, and assistant search history are translated. Search calls stream immediately; results and citation deltas arrive when supplied by the upstream. Opaque proxy metadata preserves original search items and citation offsets for replay. These locally encoded tokens are replay metadata, not provider-encrypted search content.
+- `anthropic/*`: native Messages passthrough.
+- `openai/*`: OpenAI Responses hosted `{ "type": "web_search" }`; the upstream must implement it.
+- Other model IDs: a regular Responses function that shitproxy executes locally using Kagi, then feeds back as a function output. The client sees Anthropic server search calls/results rather than client tool requests.
 
-`max_uses` maps to Responses `max_tool_calls`. The latter counts all built-in tool actions (including opening/finding pages) and ignores calls above the limit, so it cannot reproduce Anthropic's search-only limit and `max_uses_exceeded` result exactly.
+Set `KAGI_SESSION` in the proxy environment for local search. `KAGI_TURNSTILE` optionally supplies the challenge cookie. Both are personal credentials: keep them in an untracked `.env`, never in requests or committed config. Compose passes these variables into the gateway; when using a separate Claudesk Compose service, add them to that service's environment too. The adapter copies the selectors from the user's `kagi-mcp` scraper; the original package is untouched. It uses Kagi's HTML search, not Kagi's separately billed Search API. Login/challenge pages and network failures become explicit unavailable search results, not invented search results.
+
+Local searches return up to ten URLs, titles, snippets and available dates. Allowed/blocked domain restrictions are applied to the query and enforced on returned URLs. Results are snippets, not full-page extraction. Approximate `user_location` has no supported mapping in this adapter and is rejected explicitly. Later dynamic-filtering Anthropic search versions are also rejected.
+
+Reasoning and answer text stream as they arrive. The proxy executes search calls and resumes the model within one Messages response, preserving prior reasoning and tool history. Search errors are supplied to the model without exception details. Ordinary client tool calls end the response normally so the client can execute them. Proxy metadata replays local searches as their original function calls/results; it contains no Kagi credentials. The local search tool instructs the model to cite sources using markdown links; native structured citation generation is not implemented for local search. Hosted OpenAI URL citations retain their Anthropic translation.
+
+Local `max_uses` limits actual backend searches per Messages request (default five). At the limit, the function is removed from continuations; extra calls produce `max_uses_exceeded`. Continuations share the output-token budget and the request deadline, aggregate usage, and have a hard limit of sixteen model generations. Kagi searches have a twenty-second deadline and an eight-MiB HTML cap. There are no automatic retries or caches.
+
+On the hosted OpenAI route, `max_uses` instead maps to Responses `max_tool_calls`. That counts all built-in tool actions and ignores excess calls, so it is not exactly Anthropic's search-only limit. Opaque source/citation tokens are locally encoded replay metadata, not provider-encrypted search content.

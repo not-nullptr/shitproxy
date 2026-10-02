@@ -15,6 +15,7 @@
     "test:coverage": "vitest run --coverage"
   },
   "dependencies": {
+    "linkedom": "^0.18.13",
     "zod": "^4.6.5"
   },
   "devDependencies": {

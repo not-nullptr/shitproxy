@@ -718,3 +718,233 @@ it('unsupported role errors name the role without revealing message contents', a
   expect(error).toContain('tool');
   expect(error).not.toContain('secret');
 });
+describe('proxy-owned native search', () => {
+  const nativeSearch = { type: 'web_search_20250305', name: 'web_search' };
+  const searchCall = {
+    type: 'function_call',
+    id: 'fc_search',
+    call_id: 'call_search',
+    name: 'web_search',
+    arguments: JSON.stringify({ query: 'latest news' }),
+  };
+  const hits = [{ url: 'https://example.com/news', title: 'News', snippet: 'Fresh facts' }];
+  it.each([false, true])('executes and replays search through HTTP stream=%s', async (stream) => {
+    const bodies: any[] = [];
+    let searches = 0;
+    const { base } = await setup(
+      async (req, res) => {
+        const body = JSON.parse(await read(req));
+        bodies.push(body);
+        const response = { ...output, output: bodies.length === 1 ? [searchCall] : output.output };
+        if (stream) {
+          res.setHeader('content-type', 'text/event-stream');
+          res.end(
+            sse({ type: 'response.created', response: { id: response.id } }) +
+              sse({ type: 'response.completed', response }),
+          );
+        } else res.end(JSON.stringify(response));
+      },
+      {
+        search: async (query) => {
+          searches++;
+          expect(query).toBe('latest news');
+          return hits;
+        },
+      },
+    );
+    const result = await post(base, { ...request, stream, tools: [nativeSearch] });
+    expect(result.status).toBe(200);
+    let blocks: any[] = [];
+    if (stream) {
+      const events = (await result.text())
+        .split('\n')
+        .filter((line) => line.startsWith('data:'))
+        .map((line) => JSON.parse(line.slice(5)));
+      expect(events.filter((e) => e.type === 'message_start')).toHaveLength(1);
+      expect(events.filter((e) => e.type === 'message_stop')).toHaveLength(1);
+      for (const e of events) {
+        if (e.type === 'content_block_start') blocks[e.index] = e.content_block;
+        if (e.type === 'content_block_delta') {
+          if (e.delta.type === 'input_json_delta')
+            blocks[e.index].json = (blocks[e.index].json ?? '') + e.delta.partial_json;
+          if (e.delta.type === 'text_delta') blocks[e.index].text += e.delta.text;
+        }
+        if (e.type === 'content_block_stop' && blocks[e.index].json) {
+          blocks[e.index].input = JSON.parse(blocks[e.index].json);
+          delete blocks[e.index].json;
+        }
+      }
+    } else {
+      const message = await result.json();
+      blocks = message.content;
+      expect(message.stop_reason).toBe('end_turn');
+      expect(message.usage.output_tokens).toBe(2);
+    }
+    expect(searches).toBe(1);
+    expect(bodies).toHaveLength(2);
+    expect(bodies[0].tools[0].type).toBe('function');
+    expect(bodies[1].input.at(-1)).toMatchObject({
+      type: 'function_call_output',
+      call_id: 'call_search',
+      output: expect.stringContaining('Fresh facts'),
+    });
+    expect(blocks.map((b) => b.type)).toEqual([
+      'server_tool_use',
+      'web_search_tool_result',
+      'redacted_thinking',
+      'text',
+    ]);
+    await post(base, {
+      ...request,
+      tools: [nativeSearch],
+      messages: [
+        { role: 'assistant', content: blocks },
+        { role: 'user', content: 'continue' },
+      ],
+    });
+    expect(bodies[2].input[0]).toEqual(searchCall);
+    expect(bodies[2].input[1].type).toBe('function_call_output');
+    expect(searches).toBe(1);
+  });
+  it('passes ordinary web_search functions to the client without interception', async () => {
+    let searches = 0;
+    const { base } = await setup(
+      async (req, res) => {
+        const body = JSON.parse(await read(req));
+        expect(body.tools[0].type).toBe('function');
+        res.end(JSON.stringify({ ...output, output: [searchCall] }));
+      },
+      {
+        search: async () => {
+          searches++;
+          return hits;
+        },
+      },
+    );
+    const response = await post(base, {
+      ...request,
+      tools: [{ name: 'web_search', input_schema: { type: 'object' } }],
+    });
+    expect((await response.json()).content[0].type).toBe('tool_use');
+    expect(searches).toBe(0);
+  });
+  it('leaves OpenAI hosted search upstream', async () => {
+    let searches = 0;
+    const { base } = await setup(
+      async (req, res) => {
+        const body = JSON.parse(await read(req));
+        expect(body.tools).toEqual([{ type: 'web_search' }]);
+        res.end(JSON.stringify(output));
+      },
+      {
+        search: async () => {
+          searches++;
+          return hits;
+        },
+      },
+    );
+    expect(
+      (await post(base, { ...request, model: 'openai/gpt-5', tools: [nativeSearch] })).status,
+    ).toBe(200);
+    expect(searches).toBe(0);
+  });
+  it('leaves Anthropic native search bytes unchanged', async () => {
+    let searches = 0;
+    const payload = { ...request, model: 'anthropic/claude', tools: [nativeSearch] };
+    const { base } = await setup(
+      async (req, res) => {
+        expect(req.url).toBe('/v1/messages');
+        expect(await read(req)).toBe(JSON.stringify(payload));
+        res.end('{}');
+      },
+      {
+        search: async () => {
+          searches++;
+          return hits;
+        },
+      },
+    );
+    expect((await post(base, payload)).status).toBe(200);
+    expect(searches).toBe(0);
+  });
+  it('rejects missing local configuration before contacting upstream', async () => {
+    let upstream = 0;
+    const { base } = await setup((_req, res) => {
+      upstream++;
+      res.end('{}');
+    });
+    const r = await post(base, { ...request, tools: [nativeSearch] });
+    expect(r.status).toBe(400);
+    expect((await r.json()).error.message).toContain('KAGI_SESSION');
+    expect(upstream).toBe(0);
+  });
+  it.each([false, true])(
+    'reports failed continuation stream=%s without leaking upstream body',
+    async (stream) => {
+      let count = 0;
+      const { base } = await setup(
+        (_req, res) => {
+          count++;
+          if (count === 2) {
+            res.writeHead(500);
+            res.end('PERSONAL SECRET');
+            return;
+          }
+          const first = { ...output, output: [searchCall] };
+          if (stream) {
+            res.setHeader('content-type', 'text/event-stream');
+            res.end(
+              sse({ type: 'response.created', response: { id: first.id } }) +
+                sse({ type: 'response.completed', response: first }),
+            );
+          } else res.end(JSON.stringify(first));
+        },
+        { search: async () => hits },
+      );
+      const r = await post(base, { ...request, stream, tools: [nativeSearch] });
+      const body = await r.text();
+      expect(body).toContain('Upstream search continuation returned HTTP 500');
+      expect(body).not.toContain('PERSONAL SECRET');
+      if (stream) {
+        expect(body).toContain('event: error');
+        expect(body).not.toContain('event: message_stop');
+      } else expect(r.status).toBe(500);
+    },
+  );
+});
+it('bounds combined JSON search generations', async () => {
+  let count = 0;
+  const { base } = await setup(
+    (_req, res) => {
+      count++;
+      const call = {
+        type: 'function_call',
+        id: 'f',
+        call_id: 'c',
+        name: 'web_search',
+        arguments: '{"query":"news"}',
+      };
+      const payload =
+        count === 1
+          ? { ...output, output: [call] }
+          : {
+              ...output,
+              output: [
+                {
+                  ...output.output[0],
+                  content: [{ type: 'output_text', text: 'x'.repeat(400), annotations: [] }],
+                },
+              ],
+            };
+      res.end(JSON.stringify(payload));
+    },
+    { maxResponseBytes: 700, search: async () => [] },
+  );
+  const response = await post(base, {
+    ...request,
+    tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+  });
+  expect(response.status).toBe(502);
+  expect((await response.json()).error.message).toMatch(/size limit/);
+  expect(count).toBe(2);
+});
