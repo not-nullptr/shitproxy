@@ -40,6 +40,10 @@ describe('request golden translation', () => {
     'deepseek/deepseek-v4-pro',
     'deepseek-flash',
     'deepseek-v4-pro',
+    'claude-fable-subrouter-compat-v3-646565707365656E2K646565707365656E2H666F617368',
+    'opencode/deepseek-v4-flash',
+    'openai/gpt-5',
+    'custom/exact',
   ])('keeps appended budget counters out of the system prefix for %s', (model) => {
     const history = [
       { role: 'user', content: 'long stable context' },
@@ -48,7 +52,7 @@ describe('request golden translation', () => {
       { role: 'user', content: [{ type: 'tool_result', tool_use_id: call.id, content: 'ok' }] },
     ];
     const first = toResponses(req({ model, messages: history })).input as any[];
-    const second = toResponses(
+    const translated = toResponses(
       req({
         model,
         messages: [
@@ -56,7 +60,9 @@ describe('request golden translation', () => {
           { role: 'system', content: '<total_tokens>14998980 tokens left</total_tokens>' },
         ],
       }),
-    ).input as any[];
+    );
+    expect(translated.model).toBe(model);
+    const second = translated.input as any[];
     expect(second.slice(0, first.length)).toEqual(first);
     expect(second.at(-1)).toEqual({
       role: 'user',
@@ -85,10 +91,10 @@ describe('request golden translation', () => {
     ).input;
     expect(third).toEqual(second);
   });
-  it('does not demote actual instructions or alter other providers', () => {
+  it('does not demote actual instructions', () => {
     for (const [model, content] of [
-      ['openai/gpt-5', '<total_tokens>100 tokens left</total_tokens>'],
-      ['custom/exact', '<total_tokens>100 tokens left</total_tokens>'],
+      ['openai/gpt-5', 'Important system instruction'],
+      ['custom/exact', '<total_tokens>100 tokens left</total_tokens>\nImportant instruction'],
       ['deepseek/deepseek-flash', '# Environment\n<total_tokens>100 tokens left</total_tokens>'],
       [
         'deepseek/deepseek-flash',

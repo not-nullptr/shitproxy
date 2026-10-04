@@ -85,9 +85,10 @@ export function toResponses(value: unknown): JsonObject {
     // Send the counter as user content so routers cannot hoist it as an
     // instruction role. Only demote this exact informational counter, never general
     // system instructions. Native Anthropic requests bypass this translator.
+    // Do not gate on model names: Desktop uses opaque router aliases that hide
+    // the provider (for example claude-fable-subrouter-compat-v3-...).
     const role =
       message.role === 'system' &&
-      (req.model.startsWith('deepseek/') || /^deepseek-(?:flash|v4-pro)$/.test(req.model)) &&
       blocks.length === 1 &&
       blocks[0]?.type === 'text' &&
       /^<total_tokens>\d+ tokens left<\/total_tokens>$/.test(blocks[0].text)
