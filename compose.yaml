@@ -12,6 +12,7 @@ services:
       KAGI_SESSION: ${KAGI_SESSION:-}
       KAGI_TURNSTILE: ${KAGI_TURNSTILE:-}
       UPSTREAM_TIMEOUT_MS: ${UPSTREAM_TIMEOUT_MS:-600000}
+      DEBUG_CACHE: ${DEBUG_CACHE:-0}
     init: true
     read_only: true
     security_opt:

@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import {
   createServer,
   request as httpRequest,
@@ -102,6 +102,78 @@ describe('translated message identity', () => {
   );
 });
 describe('HTTP routing and protocol integration', () => {
+  it.each([false, true])(
+    'cache diagnostics preserve requests and report upstream usage (stream=%s)',
+    async (stream) => {
+      const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+      try {
+        const captured: unknown[] = [];
+        const result = {
+          ...output,
+          usage: {
+            input_tokens: 100,
+            output_tokens: 1,
+            input_tokens_details: { cached_tokens: 80 },
+          },
+        };
+        const { base } = await setup(
+          async (req, res) => {
+            captured.push(JSON.parse(await read(req)));
+            if (stream) {
+              res.setHeader('content-type', 'text/event-stream');
+              res.end(
+                sse({ type: 'response.created', response: { id: result.id } }) +
+                  sse({ type: 'response.completed', response: result }),
+              );
+            } else res.end(JSON.stringify(result));
+          },
+          { debugCache: true },
+        );
+        const payload = { ...request, stream, metadata: { user_id: 'private-session' } };
+        for (let i = 0; i < 2; i++) {
+          const response = await post(base, payload, { 'x-api-key': 'private-key' });
+          expect(response.status).toBe(200);
+          await response.text();
+        }
+        expect(captured[0]).toEqual(captured[1]);
+        const events = log.mock.calls.map(([line]) => JSON.parse(line));
+        const requests = events.filter((e) => e.type === 'cache_request');
+        const counts = events.filter((e) => e.type === 'cache_usage');
+        expect(requests).toHaveLength(2);
+        expect(counts).toHaveLength(2);
+        expect(requests[0].input).toEqual(requests[1].input);
+        expect(requests[0].session).toBe(requests[1].session);
+        expect(counts[0]).toMatchObject({
+          trace_id: requests[0].trace_id,
+          input_tokens: 100,
+          cached_tokens: 80,
+        });
+        expect(requests[0].trace_id).not.toBe(requests[1].trace_id);
+        expect(JSON.stringify(events)).not.toMatch(/private-session|private-key|upstream-secret/);
+      } finally {
+        log.mockRestore();
+      }
+    },
+  );
+
+  it('cache diagnostics are silent by default and on native passthrough', async () => {
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      for (const [debugCache, payload] of [
+        [false, request],
+        [true, { model: 'anthropic/test' }],
+      ] as const) {
+        const { base } = await setup((_req, res) => res.end(JSON.stringify(output)), {
+          debugCache,
+        });
+        await (await post(base, payload)).text();
+      }
+      expect(log).not.toHaveBeenCalled();
+    } finally {
+      log.mockRestore();
+    }
+  });
+
   it('routes all non-Anthropic models to Responses with exact ID', async () => {
     let captured: any;
     const { base } = await setup(async (req, res) => {

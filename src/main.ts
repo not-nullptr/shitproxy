@@ -20,6 +20,7 @@ const server = createGateway({
   kagiSession: process.env.KAGI_SESSION,
   kagiTurnstile: process.env.KAGI_TURNSTILE,
   debugStream: process.env.DEBUG_STREAM === '1',
+  debugCache: process.env.DEBUG_CACHE === '1',
 });
 server.listen(port, host, () => console.log(`Gateway listening on http://${host}:${port}`));
 for (const signal of ['SIGINT', 'SIGTERM'] as const)

@@ -79,10 +79,24 @@ export function toResponses(value: unknown): JsonObject {
       typeof message.content === 'string'
         ? [{ type: 'text', text: message.content }]
         : message.content;
+    // Claude Desktop's Code client appends a system token-budget update after
+    // each tool round trip. The DeepSeek route hoists system messages into the
+    // prefix, invalidating the entire conversation cache on every update.
+    // Send the counter as user content so routers cannot hoist it as an
+    // instruction role. Only demote this exact informational counter, never general
+    // system instructions. Native Anthropic requests bypass this translator.
+    const role =
+      message.role === 'system' &&
+      (req.model.startsWith('deepseek/') || /^deepseek-(?:flash|v4-pro)$/.test(req.model)) &&
+      blocks.length === 1 &&
+      blocks[0]?.type === 'text' &&
+      /^<total_tokens>\d+ tokens left<\/total_tokens>$/.test(blocks[0].text)
+        ? 'user'
+        : message.role;
     let content: JsonObject[] = [];
     const flush = () => {
       if (content.length) {
-        input.push({ role: message.role, content });
+        input.push({ role, content });
         content = [];
       }
     };

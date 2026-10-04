@@ -1,6 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { timingSafeEqual, randomUUID } from 'node:crypto';
 import { traceShape } from './trace.js';
+import { createCacheTrace } from './cache-trace.js';
 import { ProtocolError, record } from './protocol.js';
 import { toResponses, toMessage } from './translate.js';
 import { parseSse, sse, translateStream } from './stream.js';
@@ -22,6 +23,7 @@ export type GatewayConfig = {
   maxStreamBytes?: number;
   fetch?: typeof fetch;
   debugStream?: boolean;
+  debugCache?: boolean;
   kagiSession?: string;
   kagiTurnstile?: string;
   search?: Searcher;
@@ -184,6 +186,7 @@ function errorBody(error: ProtocolError) {
 export function createGateway(config: GatewayConfig) {
   const base = upstreamBase(config.upstreamUrl);
   const fetcher = config.fetch ?? fetch;
+  const cacheTrace = config.debugCache ? createCacheTrace() : undefined;
   const searcher =
     config.search ??
     (config.kagiSession
@@ -214,6 +217,11 @@ export function createGateway(config: GatewayConfig) {
     req.on('aborted', abort);
     let translatedStream = false;
     const traceId = config.debugStream ? randomUUID() : undefined;
+    const cacheTraceId = cacheTrace ? randomUUID() : undefined;
+    const traceCache = (value: unknown) => {
+      if (cacheTraceId)
+        console.error(JSON.stringify({ trace_id: cacheTraceId, ...(value as object) }));
+    };
     const trace = (direction: string, event: unknown) => {
       if (traceId)
         console.error(JSON.stringify({ trace_id: traceId, direction, ...traceShape(event) }));
@@ -264,6 +272,15 @@ export function createGateway(config: GatewayConfig) {
       target.pathname += models ? '/models' : native ? '/messages' : '/responses';
       target.search = url.search;
       const outgoing = headers(req, config, native);
+      if (translated && cacheTrace)
+        traceCache(
+          cacheTrace.request(
+            request!,
+            translated,
+            req.headers['x-claude-code-session-id'] ?? record(request!.metadata ?? {}).user_id,
+            req.headers.authorization ?? req.headers['x-api-key'],
+          ),
+        );
       if (messages) outgoing.set('content-type', 'application/json');
       const upstream = await fetcher(target, {
         method: req.method,
@@ -309,6 +326,15 @@ export function createGateway(config: GatewayConfig) {
         );
       }
       const sendContinuation = async (next: Record<string, unknown>) => {
+        if (cacheTrace)
+          traceCache(
+            cacheTrace.request(
+              request!,
+              next,
+              req.headers['x-claude-code-session-id'] ?? record(request!.metadata ?? {}).user_id,
+              req.headers.authorization ?? req.headers['x-api-key'],
+            ),
+          );
         const response = await fetcher(target, {
           method: 'POST',
           headers: outgoing,
@@ -357,9 +383,15 @@ export function createGateway(config: GatewayConfig) {
                 maxBytes: config.maxStreamBytes,
               })
             : parseSse(upstream.body!, config.maxSseFrameBytes)) {
-            if (traceId) {
+            if (traceId || cacheTrace) {
               try {
-                trace('upstream', JSON.parse(frame.data));
+                const event = JSON.parse(frame.data);
+                trace('upstream', event);
+                if (
+                  cacheTrace &&
+                  ['response.completed', 'response.incomplete'].includes(event.type)
+                )
+                  traceCache(cacheTrace.usage(event.response?.usage));
               } catch {
                 trace('upstream', { type: 'unparseable_frame' });
               }
@@ -404,6 +436,7 @@ export function createGateway(config: GatewayConfig) {
           }
         }
         const output = toMessage(response, request!.model as string);
+        if (cacheTrace) traceCache(cacheTrace.usage(response.usage));
         output.id = messageId;
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify(output));

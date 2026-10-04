@@ -35,6 +35,72 @@ const call = {
 };
 
 describe('request golden translation', () => {
+  it.each([
+    'deepseek/deepseek-flash',
+    'deepseek/deepseek-v4-pro',
+    'deepseek-flash',
+    'deepseek-v4-pro',
+  ])('keeps appended budget counters out of the system prefix for %s', (model) => {
+    const history = [
+      { role: 'user', content: 'long stable context' },
+      { role: 'system', content: '# Environment\nStable instructions.' },
+      { role: 'assistant', content: [call] },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: call.id, content: 'ok' }] },
+    ];
+    const first = toResponses(req({ model, messages: history })).input as any[];
+    const second = toResponses(
+      req({
+        model,
+        messages: [
+          ...history,
+          { role: 'system', content: '<total_tokens>14998980 tokens left</total_tokens>' },
+        ],
+      }),
+    ).input as any[];
+    expect(second.slice(0, first.length)).toEqual(first);
+    expect(second.at(-1)).toEqual({
+      role: 'user',
+      content: [{ type: 'input_text', text: '<total_tokens>14998980 tokens left</total_tokens>' }],
+    });
+    expect(second.filter((i) => i.role === 'system')).toEqual(
+      first.filter((i) => i.role === 'system'),
+    );
+    const third = toResponses(
+      req({
+        model,
+        messages: [
+          ...history,
+          {
+            role: 'system',
+            content: [
+              {
+                type: 'text',
+                text: '<total_tokens>14998980 tokens left</total_tokens>',
+                cache_control: { type: 'ephemeral' },
+              },
+            ],
+          },
+        ],
+      }),
+    ).input;
+    expect(third).toEqual(second);
+  });
+  it('does not demote actual instructions or alter other providers', () => {
+    for (const [model, content] of [
+      ['openai/gpt-5', '<total_tokens>100 tokens left</total_tokens>'],
+      ['custom/exact', '<total_tokens>100 tokens left</total_tokens>'],
+      ['deepseek/deepseek-flash', '# Environment\n<total_tokens>100 tokens left</total_tokens>'],
+      [
+        'deepseek/deepseek-flash',
+        '<total_tokens>100 tokens left</total_tokens>\nImportant instruction',
+      ],
+    ]) {
+      const input = toResponses(req({ model, messages: [{ role: 'system', content }] }))
+        .input as any[];
+      expect(input[0].role).toBe('system');
+      expect(input[0].content[0].text).toBe(content);
+    }
+  });
   it('preserves exact model and stateless defaults', () =>
     expect(toResponses(req())).toEqual({
       model: 'vendor/exact:model',
