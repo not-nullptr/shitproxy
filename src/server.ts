@@ -1,5 +1,5 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { timingSafeEqual, randomUUID } from 'node:crypto';
+import { createHash, timingSafeEqual, randomUUID } from 'node:crypto';
 import { traceShape } from './trace.js';
 import { createCacheTrace } from './cache-trace.js';
 import { ProtocolError, record } from './protocol.js';
@@ -57,7 +57,57 @@ function upstreamBase(value: string): URL {
   url.pathname = path.endsWith('/v1') ? path : path + '/v1';
   return url;
 }
-function headers(req: IncomingMessage, config: GatewayConfig, native: boolean): Headers {
+// OpenCode and the routers fronting it partition their prompt cache by an
+// `x-opencode-session` request header. A value that changes between requests
+// of one conversation keys each request to a different cache bucket, so prefix
+// reuse is lost and caching looks intermittent across providers. Claude Code
+// never sends this header, so derive a stable per-conversation value from the
+// identity it does carry, in order of how well each one scopes to a
+// conversation rather than to a user:
+//
+//  1. `x-claude-code-session-id`, an explicit per-session UUID.
+//  2. The `_session_<uuid>` segment of `metadata.user_id`, which Claude Code
+//     sends as `user_<hex>_account_<uuid>_session_<uuid>`. The surrounding
+//     segments are per-device/per-account, so they are not used.
+//  3. A hash of the conversation prefix (system, tools, first message), which
+//     is append-only and therefore stable for the life of the conversation
+//     even when the client sends no identity at all.
+//
+// The chosen value is hashed before it leaves the gateway, so no client
+// identifier is forwarded verbatim.
+function conversationPrefix(request: Record<string, unknown> | undefined): string | undefined {
+  if (!request) return undefined;
+  const messages = request.messages;
+  if (!Array.isArray(messages) || !messages.length) return undefined;
+  const canonical = JSON.stringify([request.system ?? null, request.tools ?? null, messages[0]]);
+  return createHash('sha256').update(canonical).digest('hex').slice(0, 32);
+}
+function sessionIdentity(
+  req: IncomingMessage,
+  request: Record<string, unknown> | undefined,
+): string | undefined {
+  const header = req.headers['x-claude-code-session-id'];
+  const supplied = Array.isArray(header) ? header[0] : header;
+  if (typeof supplied === 'string' && supplied.length) return supplied;
+  const metadata = request?.metadata;
+  if (metadata && typeof metadata === 'object' && !Array.isArray(metadata)) {
+    const userId = (metadata as Record<string, unknown>).user_id;
+    if (typeof userId === 'string') {
+      const match = /(?:^|_)session_([0-9A-Za-z-]{8,})/.exec(userId);
+      if (match) return `session_${match[1]}`;
+    }
+  }
+  return conversationPrefix(request);
+}
+function sessionHeader(value: string): string {
+  return createHash('sha256').update(value).digest('hex').slice(0, 32);
+}
+function headers(
+  req: IncomingMessage,
+  config: GatewayConfig,
+  native: boolean,
+  session?: string,
+): Headers {
   const out = new Headers();
   const excluded = new Set([
     ...HOP,
@@ -85,6 +135,10 @@ function headers(req: IncomingMessage, config: GatewayConfig, native: boolean): 
     if (native && typeof key === 'string') out.set('x-api-key', key);
   }
   out.set('accept-encoding', 'identity');
+  // Keep a caller-supplied session id; otherwise pin a stable one so the
+  // upstream prompt cache is not keyed to a random bucket per request.
+  if (!native && session && !out.has('x-opencode-session'))
+    out.set('x-opencode-session', sessionHeader(session));
   return out;
 }
 function authorized(req: IncomingMessage, key: string): boolean {
@@ -271,13 +325,14 @@ export function createGateway(config: GatewayConfig) {
       const target = new URL(base);
       target.pathname += models ? '/models' : native ? '/messages' : '/responses';
       target.search = url.search;
-      const outgoing = headers(req, config, native);
+      const session = messages ? sessionIdentity(req, request) : undefined;
+      const outgoing = headers(req, config, native, session);
       if (translated && cacheTrace)
         traceCache(
           cacheTrace.request(
             request!,
             translated,
-            req.headers['x-claude-code-session-id'] ?? record(request!.metadata ?? {}).user_id,
+            session,
             req.headers.authorization ?? req.headers['x-api-key'],
           ),
         );
@@ -331,7 +386,7 @@ export function createGateway(config: GatewayConfig) {
             cacheTrace.request(
               request!,
               next,
-              req.headers['x-claude-code-session-id'] ?? record(request!.metadata ?? {}).user_id,
+              session,
               req.headers.authorization ?? req.headers['x-api-key'],
             ),
           );

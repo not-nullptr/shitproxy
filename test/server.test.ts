@@ -7,6 +7,7 @@ import {
   type ServerResponse,
 } from 'node:http';
 import { once } from 'node:events';
+import { createHash } from 'node:crypto';
 import { createGateway, type GatewayConfig } from '../src/server.js';
 import { sse } from '../src/stream.js';
 const servers: Server[] = [];
@@ -100,6 +101,81 @@ describe('translated message identity', () => {
       for (const id of results) expect(id).toMatch(/^msg_[a-f0-9]{32}$/);
     },
   );
+});
+describe('OpenCode session cache header', () => {
+  const hash = (value: string) => createHash('sha256').update(value).digest('hex').slice(0, 32);
+  async function capturedHeaders(
+    payload: unknown = request,
+    headers: Record<string, string> = {},
+  ): Promise<IncomingMessage['headers']> {
+    let seen: IncomingMessage['headers'] = {};
+    const { base } = await setup((req, res) => {
+      seen = req.headers;
+      res.end(JSON.stringify(output));
+    });
+    await (await post(base, payload, headers)).text();
+    return seen;
+  }
+  it('pins a stable header derived from the Claude Code session id', async () => {
+    const first = await capturedHeaders(request, { 'x-claude-code-session-id': 'session-abc' });
+    const second = await capturedHeaders(request, { 'x-claude-code-session-id': 'session-abc' });
+    expect(first['x-opencode-session']).toBe(hash('session-abc'));
+    expect(second['x-opencode-session']).toBe(first['x-opencode-session']);
+    const other = await capturedHeaders(request, { 'x-claude-code-session-id': 'session-xyz' });
+    expect(other['x-opencode-session']).not.toBe(first['x-opencode-session']);
+  });
+  it('uses only the session segment of a composite Claude Code user_id', async () => {
+    const userId =
+      'user_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef' +
+      '_account_7f3a1c2e-0000-4000-8000-00000000abcd_session_9c1d2e3f-1111-4222-8333-444455556666';
+    const headers = await capturedHeaders({ ...request, metadata: { user_id: userId } });
+    expect(headers['x-opencode-session']).toBe(
+      hash('session_9c1d2e3f-1111-4222-8333-444455556666'),
+    );
+  });
+  it('does not key the account-level part of a user_id to the conversation', async () => {
+    const shared =
+      'user_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef' +
+      '_account_7f3a1c2e-0000-4000-8000-00000000abcd';
+    const first = await capturedHeaders({ ...request, metadata: { user_id: shared } });
+    const same = await capturedHeaders({ ...request, metadata: { user_id: shared } });
+    const other = await capturedHeaders({
+      ...request,
+      messages: [{ role: 'user', content: 'a different conversation' }],
+      metadata: { user_id: shared },
+    });
+    expect(same['x-opencode-session']).toBe(first['x-opencode-session']);
+    expect(other['x-opencode-session']).not.toBe(first['x-opencode-session']);
+  });
+  it('derives a conversation key from the append-only prefix with no identity', async () => {
+    const grown = [...request.messages, { role: 'assistant', content: 'ok' }];
+    const first = await capturedHeaders();
+    const next = await capturedHeaders({ ...request, messages: grown });
+    const other = await capturedHeaders({
+      ...request,
+      messages: [{ role: 'user', content: 'unrelated' }],
+    });
+    expect(first['x-opencode-session']).toBeDefined();
+    // Appending turns keeps the prefix, so the bucket is stable across a conversation.
+    expect(next['x-opencode-session']).toBe(first['x-opencode-session']);
+    expect(other['x-opencode-session']).not.toBe(first['x-opencode-session']);
+  });
+  it('preserves a caller-supplied session header', async () => {
+    const headers = await capturedHeaders(
+      { ...request, metadata: { user_id: 'user-1' } },
+      {
+        'x-opencode-session': 'explicit-session',
+      },
+    );
+    expect(headers['x-opencode-session']).toBe('explicit-session');
+  });
+  it('does not send the header on the native Anthropic path', async () => {
+    const headers = await capturedHeaders(
+      { model: 'anthropic/test', max_tokens: 100, messages: [{ role: 'user', content: 'hi' }] },
+      { 'x-claude-code-session-id': 'session-abc' },
+    );
+    expect(headers['x-opencode-session']).toBeUndefined();
+  });
 });
 describe('HTTP routing and protocol integration', () => {
   it.each([false, true])(
