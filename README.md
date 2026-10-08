@@ -5,6 +5,7 @@ A dedicated TypeScript gateway for Claude clients using a router that serves bot
 - `POST /v1/messages`, model starts with **`anthropic/`**: send the original JSON bytes to upstream `/v1/messages`. Native tools, thinking, signatures, beta headers, errors, and SSE stay on the Anthropic path.
 - The web client's exact bare IDs `claude-haiku-4-5-20251001` and `claude-sonnet-5-5` are prefixed with `anthropic/` and routed to native Messages. Their JSON bodies are reserialized for this rewrite; other fields are retained.
 - Every other model: translate Messages to upstream `/v1/responses`, then translate JSON or streaming SSE back to Messages. **Preserve the model ID exactly.** Other bare `claude-*` IDs are not rewritten.
+- A model id ending in **`:nothink`** (for example `deepseek/deepseek-flash:nothink`) has the suffix stripped before routing and thinking fully disabled for that request: `thinking` is forced to `disabled` and any `output_config.effort` is removed. This applies on both the native and translated paths, after suffix stripping but before the bare-ID rewrite above.
 - `GET /v1/models`: proxy the upstream model listing, including query parameters.
 - `GET /healthz`: local process liveness, without making a model request.
 

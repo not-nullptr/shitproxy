@@ -308,9 +308,29 @@ export function createGateway(config: GatewayConfig) {
         if (typeof request.model !== 'string' || !request.model.length)
           throw new ProtocolError('model must be a non-empty string');
         let model = request.model;
+        let rewritten = false;
+        // A trailing `:nothink` on the model id (for example
+        // `deepseek/deepseek-flash:nothink`) is a client-side switch to fully
+        // disable thinking for this request. Strip the suffix before routing,
+        // force thinking off, and clear any reasoning effort that would
+        // otherwise re-enable it on the Responses path.
+        const NOTHINK = ':nothink';
+        if (model.endsWith(NOTHINK) && model.length > NOTHINK.length) {
+          model = model.slice(0, -NOTHINK.length);
+          request.thinking = { type: 'disabled' };
+          const output = request.output_config;
+          if (output && typeof output === 'object' && !Array.isArray(output)) {
+            delete (output as Record<string, unknown>).effort;
+            if (!Object.keys(output).length) delete request.output_config;
+          }
+          rewritten = true;
+        }
         // Exact bare IDs observed in requests from the web client.
         if (model === 'claude-haiku-4-5-20251001' || model === 'claude-sonnet-5-5') {
           model = `anthropic/${model}`;
+          rewritten = true;
+        }
+        if (rewritten) {
           request.model = model;
           raw = Buffer.from(JSON.stringify(request), 'utf8');
         }

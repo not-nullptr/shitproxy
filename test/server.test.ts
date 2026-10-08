@@ -826,6 +826,72 @@ describe('web client Sonnet alias', () => {
   });
 });
 
+describe(':nothink model suffix', () => {
+  it('strips the suffix and disables reasoning on the Responses path', async () => {
+    let captured: any;
+    const { base } = await setup(async (req, res) => {
+      captured = { url: req.url, body: JSON.parse(await read(req)) };
+      res.end(JSON.stringify(output));
+    });
+    const result = await post(base, {
+      ...request,
+      model: 'deepseek/deepseek-flash:nothink',
+      thinking: { type: 'enabled', budget_tokens: 2048 },
+      output_config: { effort: 'high', format: { type: 'json_schema', schema: {} } },
+    });
+    expect(result.status).toBe(200);
+    expect(captured.url).toBe('/v1/responses');
+    expect(captured.body.model).toBe('deepseek/deepseek-flash');
+    expect(captured.body.reasoning).toBeUndefined();
+    expect(captured.body.text).toEqual({
+      format: { type: 'json_schema', name: 'response', schema: {}, strict: true },
+    });
+  });
+  it('strips the suffix on a native alias and sends disabled thinking', async () => {
+    let captured: any;
+    const { base } = await setup(async (req, res) => {
+      captured = { url: req.url, body: JSON.parse(await read(req)) };
+      res.setHeader('content-type', 'application/json');
+      res.end('{"native":true}');
+    });
+    const result = await post(base, {
+      model: 'claude-sonnet-5-5:nothink',
+      max_tokens: 128,
+      messages: [{ role: 'user', content: 'hi' }],
+      thinking: { type: 'adaptive' },
+    });
+    expect(result.status).toBe(200);
+    expect(captured.url).toBe('/v1/messages');
+    expect(captured.body.model).toBe('anthropic/claude-sonnet-5-5');
+    expect(captured.body.thinking).toEqual({ type: 'disabled' });
+  });
+  it('leaves models without the suffix and their reasoning untouched', async () => {
+    let captured: any;
+    const { base } = await setup(async (req, res) => {
+      captured = { url: req.url, body: JSON.parse(await read(req)) };
+      res.end(JSON.stringify(output));
+    });
+    const result = await post(base, {
+      ...request,
+      max_tokens: 4096,
+      model: 'openrouter/glm-5.3-flash',
+      thinking: { type: 'enabled', budget_tokens: 2048 },
+    });
+    expect(result.status).toBe(200);
+    expect(captured.body.model).toBe('openrouter/glm-5.3-flash');
+    expect(captured.body.reasoning).toEqual({ effort: 'medium', summary: 'auto' });
+  });
+  it('does not strip a bare :nothink with no model prefix', async () => {
+    let captured: any;
+    const { base } = await setup(async (req, res) => {
+      captured = { url: req.url, body: JSON.parse(await read(req)) };
+      res.end(JSON.stringify(output));
+    });
+    expect((await post(base, { ...request, model: ':nothink' })).status).toBe(200);
+    expect(captured.body.model).toBe(':nothink');
+  });
+});
+
 it.each(['system', 'developer'])(
   'web client %s history reaches Responses without changing its role',
   async (role) => {
