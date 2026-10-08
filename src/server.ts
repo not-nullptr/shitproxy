@@ -24,6 +24,7 @@ export type GatewayConfig = {
   fetch?: typeof fetch;
   debugStream?: boolean;
   debugCache?: boolean;
+  debugErrors?: boolean;
   kagiSession?: string;
   kagiTurnstile?: string;
   search?: Searcher;
@@ -237,6 +238,66 @@ async function write(res: ServerResponse, value: string | Uint8Array): Promise<v
 function errorBody(error: ProtocolError) {
   return { type: 'error', error: { type: error.kind, message: error.message } };
 }
+// Upstream error bodies are read only to extract a structured diagnostic
+// message. Raw bodies are never echoed downstream (see README); with
+// DEBUG_ERRORS=1 the bounded body is logged to the proxy console instead.
+const maxErrorBodyBytes = 8192;
+const maxErrorMessageLength = 500;
+function findErrorMessage(value: unknown): string | undefined {
+  if (typeof value === 'string') return value.trim() || undefined;
+  if (Array.isArray(value)) {
+    const parts = value.map(findErrorMessage).filter((part): part is string => !!part);
+    return parts.length ? parts.join('; ') : undefined;
+  }
+  if (!value || typeof value !== 'object') return undefined;
+  const object = value as Record<string, unknown>;
+  for (const key of ['message', 'msg', 'detail', 'error'])
+    if (key in object) {
+      const found = findErrorMessage(object[key]);
+      if (found) return found;
+    }
+  return undefined;
+}
+async function upstreamErrorDetail(
+  upstream: Response,
+  endpoint: string,
+  model: unknown,
+  debug: boolean,
+): Promise<string | undefined> {
+  if (!upstream.body) return undefined;
+  const reader = upstream.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    while (size < maxErrorBodyBytes) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      size += value.length;
+    }
+  } catch {
+    // A body that cannot be read leaves only the status to report.
+  } finally {
+    await reader.cancel().catch(() => {});
+    reader.releaseLock();
+  }
+  const body = Buffer.concat(chunks).subarray(0, maxErrorBodyBytes).toString('utf8');
+  if (debug)
+    console.error(
+      JSON.stringify({
+        type: 'upstream_error',
+        status: upstream.status,
+        endpoint,
+        model,
+        body,
+      }),
+    );
+  try {
+    return findErrorMessage(JSON.parse(body))?.slice(0, maxErrorMessageLength);
+  } catch {
+    return undefined;
+  }
+}
 export function createGateway(config: GatewayConfig) {
   const base = upstreamBase(config.upstreamUrl);
   const fetcher = config.fetch ?? fetch;
@@ -382,7 +443,12 @@ export function createGateway(config: GatewayConfig) {
         return;
       }
       if (!upstream.ok) {
-        if (upstream.body) await upstream.body.cancel();
+        const detail = await upstreamErrorDetail(
+          upstream,
+          '/v1/responses',
+          request!.model,
+          config.debugErrors ?? false,
+        );
         const status = upstream.status >= 400 && upstream.status <= 599 ? upstream.status : 502;
         const kind =
           status === 429
@@ -395,7 +461,8 @@ export function createGateway(config: GatewayConfig) {
         if (upstream.headers.has('retry-after'))
           res.setHeader('retry-after', upstream.headers.get('retry-after')!);
         throw new ProtocolError(
-          `Upstream /v1/responses returned HTTP ${upstream.status} for model ${JSON.stringify(request!.model)}`,
+          `Upstream /v1/responses returned HTTP ${upstream.status} for model ${JSON.stringify(request!.model)}` +
+            (detail ? ` — upstream: ${detail}` : ''),
           status,
           kind,
         );
@@ -418,9 +485,15 @@ export function createGateway(config: GatewayConfig) {
           redirect: 'manual',
         });
         if (!response.ok) {
-          await response.body?.cancel();
+          const detail = await upstreamErrorDetail(
+            response,
+            '/v1/responses (search continuation)',
+            request!.model,
+            config.debugErrors ?? false,
+          );
           throw new ProtocolError(
-            `Upstream search continuation returned HTTP ${response.status}`,
+            `Upstream search continuation returned HTTP ${response.status}` +
+              (detail ? ` — upstream: ${detail}` : ''),
             response.status >= 400 && response.status <= 599 ? response.status : 502,
             'api_error',
           );

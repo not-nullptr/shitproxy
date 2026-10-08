@@ -471,6 +471,65 @@ describe('HTTP routing and protocol integration', () => {
       expect((await post(base)).status).toBe(502);
     },
   );
+  it('surfaces a structured upstream error message without echoing the body', async () => {
+    const { base } = await setup((_req, res) => {
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: { message: 'unknown provider', secret: 'upstream-secret' } }));
+    });
+    const r = await post(base);
+    expect(r.status).toBe(400);
+    const body = await r.text();
+    expect(body).toContain('returned HTTP 400');
+    expect(body).toContain('unknown provider');
+    expect(body).not.toContain('upstream-secret');
+  });
+  it('extracts FastAPI-style detail arrays from upstream errors', async () => {
+    const { base } = await setup((_req, res) => {
+      res.writeHead(422, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ detail: [{ msg: 'model is required', loc: ['body', 'model'] }] }));
+    });
+    const r = await post(base);
+    expect(r.status).toBe(422);
+    const body = await r.text();
+    expect(body).toContain('model is required');
+    expect(body).not.toContain('body.model');
+  });
+  it('ignores an unstructured upstream error body', async () => {
+    const { base } = await setup((_req, res) => {
+      res.writeHead(500);
+      res.end('PERSONAL SECRET');
+    });
+    const r = await post(base);
+    expect(r.status).toBe(500);
+    const body = await r.text();
+    expect(body).toContain('returned HTTP 500');
+    expect(body).not.toContain('PERSONAL SECRET');
+  });
+  it('logs the bounded upstream error body only with debugErrors', async () => {
+    const logs: string[] = [];
+    const spy = vi.spyOn(console, 'error').mockImplementation((v) => void logs.push(String(v)));
+    try {
+      const { base } = await setup(
+        (_req, res) => {
+          res.writeHead(502);
+          res.end('{"error":{"message":"boom"},"extra":"SECRET"}');
+        },
+        { debugErrors: true },
+      );
+      await post(base);
+    } finally {
+      spy.mockRestore();
+    }
+    const record = logs
+      .map((line) => JSON.parse(line))
+      .find((entry) => entry.type === 'upstream_error');
+    expect(record).toMatchObject({
+      status: 502,
+      endpoint: '/v1/responses',
+      model: request.model,
+    });
+    expect(record.body).toContain('SECRET');
+  });
   it('upstream JSON size limit', async () => {
     const { base } = await setup((_req, res) => res.end(JSON.stringify(output)), {
       maxResponseBytes: 10,
