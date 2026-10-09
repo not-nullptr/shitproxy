@@ -233,9 +233,188 @@ describe('request golden translation', () => {
         ],
       }),
     );
-    expect((out.input as any[])[2].output).toEqual([
-      { type: 'input_image', image_url: 'https://example.com/image?token=x' },
+    // The router drops a function call output carrying an image, leaving the
+    // tool call unanswered, so the image is replayed as a following user
+    // message and the tool reply stays text-only.
+    expect((out.input as any[]).slice(1)).toEqual([
+      {
+        type: 'function_call',
+        call_id: 'call_1',
+        name: 'Task',
+        arguments: JSON.stringify(call.input),
+      },
+      { type: 'function_call_output', call_id: 'call_1', output: '' },
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'input_text',
+            text: '<tool_call_result>Images are attached to this message</tool_call_result>',
+          },
+          { type: 'input_image', image_url: 'https://example.com/image?token=x' },
+        ],
+      },
     ]);
+  });
+  it('keeps tool reply text and replays its image separately', () => {
+    const image = {
+      type: 'image',
+      source: { type: 'url', url: 'https://example.com/a.png' },
+    };
+    const out = toResponses(
+      req({
+        messages: [
+          { role: 'assistant', content: [call] },
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'tool_result',
+                tool_use_id: 'call_1',
+                content: [{ type: 'text', text: 'rendered' }, image],
+              },
+            ],
+          },
+        ],
+      }),
+    );
+    expect((out.input as any[]).slice(1)).toEqual([
+      {
+        type: 'function_call_output',
+        call_id: 'call_1',
+        output: [{ type: 'input_text', text: 'rendered' }],
+      },
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'input_text',
+            text: '<tool_call_result>Images are attached to this message</tool_call_result>',
+          },
+          { type: 'input_image', image_url: 'https://example.com/a.png' },
+        ],
+      },
+    ]);
+  });
+  it('groups parallel tool result images after the contiguous tool outputs', () => {
+    const image = (url: string) => ({ type: 'image', source: { type: 'url', url } });
+    const out = toResponses(
+      req({
+        messages: [
+          {
+            role: 'assistant',
+            content: [call, { ...call, id: 'call_2', input: { prompt: 'other' } }],
+          },
+          {
+            role: 'user',
+            content: [
+              { type: 'tool_result', tool_use_id: 'call_1', content: [image('https://a/1.png')] },
+              { type: 'tool_result', tool_use_id: 'call_2', content: [image('https://a/2.png')] },
+            ],
+          },
+        ],
+      }),
+    );
+    expect(out.input).toEqual([
+      {
+        type: 'function_call',
+        call_id: 'call_1',
+        name: 'Task',
+        arguments: JSON.stringify(call.input),
+      },
+      {
+        type: 'function_call',
+        call_id: 'call_2',
+        name: 'Task',
+        arguments: JSON.stringify({ prompt: 'other' }),
+      },
+      { type: 'function_call_output', call_id: 'call_1', output: '' },
+      { type: 'function_call_output', call_id: 'call_2', output: '' },
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'input_text',
+            text: '<tool_call_result>Images are attached to this message</tool_call_result>',
+          },
+          { type: 'input_image', image_url: 'https://a/1.png' },
+          { type: 'input_image', image_url: 'https://a/2.png' },
+        ],
+      },
+    ]);
+  });
+  it('adds one hint text for several images from one tool result', () => {
+    const image = (url: string) => ({ type: 'image', source: { type: 'url', url } });
+    const out = toResponses(
+      req({
+        messages: [
+          { role: 'assistant', content: [call] },
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'tool_result',
+                tool_use_id: 'call_1',
+                content: [image('https://a/1.png'), image('https://a/2.png')],
+              },
+            ],
+          },
+        ],
+      }),
+    );
+    expect((out.input as any[]).at(-1)).toEqual({
+      role: 'user',
+      content: [
+        {
+          type: 'input_text',
+          text: '<tool_call_result>Images are attached to this message</tool_call_result>',
+        },
+        { type: 'input_image', image_url: 'https://a/1.png' },
+        { type: 'input_image', image_url: 'https://a/2.png' },
+      ],
+    });
+  });
+  it('flushes replay images before the next assistant turn', () => {
+    const image = { type: 'image', source: { type: 'url', url: 'https://a/x.png' } };
+    const out = toResponses(
+      req({
+        messages: [
+          { role: 'assistant', content: [call] },
+          {
+            role: 'user',
+            content: [{ type: 'tool_result', tool_use_id: 'call_1', content: [image] }],
+          },
+          { role: 'assistant', content: [{ type: 'text', text: 'seen' }] },
+        ],
+      }),
+    );
+    expect((out.input as any[]).map((i) => i.role ?? i.type)).toEqual([
+      'function_call',
+      'function_call_output',
+      'user',
+      'assistant',
+    ]);
+  });
+  it('answers an erroring image-only tool result', () => {
+    const image = { type: 'image', source: { type: 'url', url: 'https://a/x.png' } };
+    const out = toResponses(
+      req({
+        messages: [
+          { role: 'assistant', content: [call] },
+          {
+            role: 'user',
+            content: [
+              { type: 'tool_result', tool_use_id: 'call_1', is_error: true, content: [image] },
+            ],
+          },
+        ],
+      }),
+    );
+    expect((out.input as any[])[1]).toEqual({
+      type: 'function_call_output',
+      call_id: 'call_1',
+      output: '[tool_error]\n',
+    });
   });
   it('maps schema without strictification', () => {
     const tools = [

@@ -74,6 +74,32 @@ export function toResponses(value: unknown): JsonObject {
       results?: Extract<Block, { type: 'web_search_tool_result' }>;
     }
   >();
+  // Routers fronting a chat-completions provider cannot represent image content
+  // inside a function call output: they drop the tool message, leaving the
+  // assistant tool_calls message unanswered and the provider rejecting the
+  // request ("insufficient tool messages following tool_calls message"). Tool
+  // results may carry images, so hold them back and replay them as a user
+  // message placed after the contiguous run of tool outputs. A user message
+  // must never interleave the tool outputs, or the same provider check fails.
+  const pendingImages: JsonObject[] = [];
+  const flushImages = () => {
+    if (!pendingImages.length) return;
+    // The tool replies are empty (an image cannot ride inside a function call
+    // output here), so the model otherwise reads the tool results as "the tool
+    // returned nothing" and never connects the trailing user images to the
+    // calls. One leading hint text covers them all; per-image labels make the
+    // model read each label as the (empty) tool output instead.
+    input.push({
+      role: 'user',
+      content: [
+        {
+          type: 'input_text',
+          text: '<tool_call_result>Images are attached to this message</tool_call_result>',
+        },
+        ...pendingImages.splice(0),
+      ],
+    });
+  };
   for (const message of req.messages) {
     const blocks: Block[] =
       typeof message.content === 'string'
@@ -102,6 +128,8 @@ export function toResponses(value: unknown): JsonObject {
       }
     };
     for (const block of blocks) {
+      // Buffer held-back images until the run of tool outputs ends.
+      if (block.type !== 'tool_result') flushImages();
       if (block.type === 'text' || block.type === 'image') {
         content.push(inputPart(block, message.role));
         continue;
@@ -181,10 +209,17 @@ export function toResponses(value: unknown): JsonObject {
           throw new ProtocolError('Tool result has no preceding call');
         if (results.has(block.tool_use_id)) throw new ProtocolError('Duplicate tool result');
         results.add(block.tool_use_id);
-        let output: string | JsonObject[] =
-          typeof block.content === 'string'
-            ? block.content
-            : (block.content ?? []).map((b) => inputPart(b));
+        const parts = typeof block.content === 'string' ? undefined : (block.content ?? []);
+        const images = (parts ?? []).filter((b) => b.type === 'image');
+        let output: string | JsonObject[];
+        if (typeof block.content === 'string') output = block.content;
+        else if (images.length) {
+          // Keep only the text as the tool reply; an image-only result still
+          // needs a non-empty reply so the tool call is answered.
+          const text = parts!.filter((b) => b.type === 'text').map((b) => inputPart(b));
+          output = text.length ? text : '';
+        } else output = parts!.map((b) => inputPart(b));
+        for (const image of images) pendingImages.push(inputPart(image));
         if (block.is_error)
           output =
             typeof output === 'string'
@@ -199,6 +234,7 @@ export function toResponses(value: unknown): JsonObject {
     }
     flush();
   }
+  flushImages();
   for (const search of searches.values())
     if (!search.results) throw new ProtocolError('Web search history has no result');
   const out: JsonObject = {
