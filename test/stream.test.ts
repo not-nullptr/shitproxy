@@ -969,3 +969,78 @@ it.each([undefined, 'final_answer', 'commentary', null])(
     if (phase !== undefined) expect((replay.input as any[])[2].phase).toBe(phase);
   },
 );
+
+it('repairs an answer prefix longer than 16 characters overtaken by reasoning', async () => {
+  const thought0 = 'Deliver summary. Keep short. Mention the escalation';
+  const answer0 = 'Done: **STIRRUP —';
+  const thought1 = 'arc. Mention notes contain stage directions.';
+  const answer1 = "It's Tinder for horses.** 11 slides, all checked.";
+  const r0 = {
+    type: 'reasoning',
+    id: 'r0',
+    summary: [],
+    content: [{ type: 'reasoning_text', text: thought0 }],
+    encrypted_content: 'opaque-0',
+  };
+  const a = {
+    type: 'message',
+    id: 'a',
+    role: 'assistant',
+    content: [{ type: 'output_text', text: answer0, annotations: [] }],
+  };
+  const r1 = {
+    type: 'reasoning',
+    id: 'r1',
+    summary: [],
+    content: [{ type: 'reasoning_text', text: thought1 }],
+    encrypted_content: 'opaque-1',
+  };
+  const b = {
+    type: 'message',
+    id: 'b',
+    role: 'assistant',
+    status: 'completed',
+    content: [{ type: 'output_text', text: answer1, annotations: [] }],
+  };
+  const delta = (
+    type: string,
+    output_index: number,
+    item_id: string,
+    text: string,
+    content_index = 0,
+  ) => ({ type, output_index, item_id, content_index, delta: text });
+  const events = await run([
+    created,
+    added(r0),
+    delta('response.reasoning_text.delta', 0, 'r0', thought0),
+    done(r0),
+    added(a, 1),
+    delta('response.output_text.delta', 1, 'a', answer0),
+    done(a, 1),
+    added(r1, 2),
+    delta('response.reasoning_text.delta', 2, 'r1', thought1),
+    done(r1, 2),
+    added(b, 3),
+    delta('response.output_text.delta', 3, 'b', answer1),
+    done(b, 3),
+    complete([r0, a, r1, b]),
+  ]);
+  const message = assemble(events);
+  expect(message.content.map((b: any) => b.type)).toEqual(['thinking', 'thinking', 'text']);
+  expect(message.content[2].text).toBe(answer0 + answer1);
+  expect(message.content[0].thinking).toBe(thought0);
+  expect(message.content[1].thinking).toBe(thought1);
+  let active: unknown;
+  for (const e of events) {
+    if (e.type === 'content_block_start') {
+      expect(active).toBeUndefined();
+      active = e.index;
+    }
+    if (e.type === 'content_block_delta') expect(e.index).toBe(active);
+    if (e.type === 'content_block_stop') {
+      expect(e.index).toBe(active);
+      active = undefined;
+    }
+  }
+  expect(active).toBeUndefined();
+});

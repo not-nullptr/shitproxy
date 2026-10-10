@@ -89,18 +89,22 @@ describe('bounded answer prefix repair', () => {
       expect(out[1].signature).toBe('opaque-preserved');
     },
   );
-  it.each([16, 17, 100])('releases %i characters and keeps later reasoning in order', async (n) => {
-    const out = blocks(
-      await run([
-        ...thought(0),
-        ...text(1, 'x'.repeat(n)),
-        ...thought(2),
-        ...text(3, 'remaining'),
-        end,
-      ]),
-    );
-    expect(out.map((b) => b.type)).toEqual(['thinking', 'text', 'thinking', 'text']);
-  });
+  it.each([16, 17, 100, 4096])(
+    'merges a %i character prefix ahead of trailing reasoning',
+    async (n) => {
+      const out = blocks(
+        await run([
+          ...thought(0),
+          ...text(1, 'x'.repeat(n)),
+          ...thought(2),
+          ...text(3, 'remaining'),
+          end,
+        ]),
+      );
+      expect(out.map((b) => b.type)).toEqual(['thinking', 'thinking', 'text']);
+      expect(out[2].text).toBe('x'.repeat(n) + 'remaining');
+    },
+  );
   it('does not delay or merge ordinary text without reasoning', async () => {
     const input = [...text(0, 'a'), ...text(1, 'b'), end];
     expect(await run(input)).toEqual(input);
@@ -206,7 +210,7 @@ describe('bounded answer prefix repair', () => {
       await gate;
       yield end;
     }
-    const iterator = repairAnswerPrefix(input(), 16, 5);
+    const iterator = repairAnswerPrefix(input(), 5);
     const events = [];
     while (events.length < 7) events.push((await iterator.next()).value!);
     expect(events[4].type).toBe('content_block_start');
@@ -227,11 +231,11 @@ describe('bounded answer prefix repair', () => {
       yield* text(3, ' indeed');
       yield end;
     }
-    const out = blocks(await collect(repairAnswerPrefix(input(), 16, 5)));
+    const out = blocks(await collect(repairAnswerPrefix(input(), 5)));
     expect(out.map((b) => b.type)).toEqual(['thinking', 'thinking', 'text']);
     expect(out[2].text).toBe('Yes indeed');
   });
-  it('streams the answer before response completion once the threshold is met', async () => {
+  it('streams the answer before response completion once the hold window elapses', async () => {
     let resolve!: () => void;
     const gate = new Promise<void>((r) => (resolve = r));
     async function* input() {
@@ -242,7 +246,7 @@ describe('bounded answer prefix repair', () => {
       yield stop(1);
       yield end;
     }
-    const iterator = repairAnswerPrefix(input());
+    const iterator = repairAnswerPrefix(input(), 5);
     let e: JsonObject;
     do {
       e = (await iterator.next()).value!;

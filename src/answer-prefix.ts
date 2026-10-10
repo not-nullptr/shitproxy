@@ -2,12 +2,13 @@ import type { JsonObject } from './protocol.js';
 import { shiftCitation } from './web-search.js';
 import { messageEnvelope, replayMessage } from './message-state.js';
 
-/** Repair a short answer prefix overtaking the last reasoning fragment.
- * Only the opening answer is delayed; reasoning and the rest of the answer stream.
+/** Repair an answer prefix overtaking trailing reasoning fragments.
+ * The opening answer is buffered until reasoning resumes, a barrier or the end
+ * of the response arrives, or the hold window elapses. Reasoning streams
+ * immediately; the held prefix and later answer fragments merge into one block.
  */
 export async function* repairAnswerPrefix(
   source: AsyncIterable<JsonObject>,
-  limit = 16,
   timeoutMs = 200,
 ): AsyncGenerator<JsonObject> {
   const iterator = source[Symbol.asyncIterator]();
@@ -17,7 +18,6 @@ export async function* repairAnswerPrefix(
     eligible = true,
     holdingIndex: number | undefined;
   let held: JsonObject[] = [],
-    characters = 0,
     repaired = false;
   let mergedText: number | undefined;
   let mergedValue = '';
@@ -91,7 +91,6 @@ export async function* repairAnswerPrefix(
     expired = false;
     for (const event of held) yield* emit(event);
     held = [];
-    characters = 0;
   }
   try {
     while (true) {
@@ -140,9 +139,6 @@ export async function* repairAnswerPrefix(
       }
       if (typeof event.index === 'number' && event.index === holdingIndex) {
         held.push(event);
-        const delta = event.delta as JsonObject | undefined;
-        if (delta?.type === 'text_delta') characters += Array.from(delta.text as string).length;
-        if (characters >= limit) yield* release();
         continue;
       }
       if (event.type === 'message_delta' || event.type === 'message_stop') yield* release();
