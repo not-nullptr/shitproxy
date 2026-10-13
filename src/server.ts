@@ -28,6 +28,15 @@ export type GatewayConfig = {
   kagiSession?: string;
   kagiTurnstile?: string;
   search?: Searcher;
+  /**
+   * Per-request upstream credential resolution. When set, the caller's own
+   * `x-api-key` (or bearer) is treated as an opaque identity and swapped for the
+   * upstream key this function returns; a `null` result refuses the request with
+   * a 401. Resolution is authoritative — `upstreamApiKey` is not used as a
+   * fallback, so an unrecognised caller never spends the operator's key. This
+   * lets a multi-tenant front end bill each caller's inference to their own key.
+   */
+  resolveUpstreamKey?: (key: string) => Promise<string | null>;
 };
 const HOP = new Set([
   'connection',
@@ -108,6 +117,7 @@ function headers(
   config: GatewayConfig,
   native: boolean,
   session?: string,
+  resolvedKey?: string,
 ): Headers {
   const out = new Headers();
   const excluded = new Set([
@@ -125,7 +135,12 @@ function headers(
       continue;
     out.set(key, Array.isArray(value) ? value.join(',') : value);
   }
-  if (config.upstreamApiKey) {
+  if (resolvedKey) {
+    // The caller's identity was resolved to an upstream credential; it always
+    // wins over the static key, since resolution is authoritative.
+    out.set('authorization', `Bearer ${resolvedKey}`);
+    if (native) out.set('x-api-key', resolvedKey);
+  } else if (config.upstreamApiKey) {
     out.set('authorization', `Bearer ${config.upstreamApiKey}`);
     if (native) out.set('x-api-key', config.upstreamApiKey);
   } else {
@@ -141,6 +156,12 @@ function headers(
   if (!native && session && !out.has('x-opencode-session'))
     out.set('x-opencode-session', sessionHeader(session));
   return out;
+}
+/** The caller's presented key: the `x-api-key` header, else a bearer token. */
+function callerKey(req: IncomingMessage): string | undefined {
+  const header = req.headers['x-api-key'];
+  if (typeof header === 'string' && header.length) return header;
+  return req.headers.authorization?.replace(/^Bearer /, '');
 }
 function authorized(req: IncomingMessage, key: string): boolean {
   const supplied = req.headers['x-api-key'] ?? req.headers.authorization?.replace(/^Bearer /, '');
@@ -348,8 +369,20 @@ export function createGateway(config: GatewayConfig) {
         res.end('{"status":"ok"}');
         return;
       }
-      if (config.clientApiKey && !authorized(req, config.clientApiKey))
+      let resolvedKey: string | undefined;
+      if (config.resolveUpstreamKey) {
+        // Multi-tenant: the caller's own key identifies them. Swap it for the
+        // upstream credential this request should use. An unknown caller is
+        // refused rather than falling back to a shared key, so one tenant's
+        // inference can never be billed to the operator's key.
+        const caller = callerKey(req);
+        const resolved = caller ? await config.resolveUpstreamKey(caller) : null;
+        if (!resolved)
+          throw new ProtocolError('Invalid gateway API key', 401, 'authentication_error');
+        resolvedKey = resolved;
+      } else if (config.clientApiKey && !authorized(req, config.clientApiKey)) {
         throw new ProtocolError('Invalid gateway API key', 401, 'authentication_error');
+      }
       const models = url.pathname === '/v1/models' && req.method === 'GET';
       const messages = url.pathname === '/v1/messages' && req.method === 'POST';
       if (!models && !messages)
@@ -407,7 +440,7 @@ export function createGateway(config: GatewayConfig) {
       target.pathname += models ? '/models' : native ? '/messages' : '/responses';
       target.search = url.search;
       const session = messages ? sessionIdentity(req, request) : undefined;
-      const outgoing = headers(req, config, native, session);
+      const outgoing = headers(req, config, native, session, resolvedKey);
       if (translated && cacheTrace)
         traceCache(
           cacheTrace.request(

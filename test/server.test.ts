@@ -402,6 +402,87 @@ describe('HTTP routing and protocol integration', () => {
     );
     expect(await (await fetch(base + '/healthz')).json()).toEqual({ status: 'ok' });
   });
+  describe('per-request upstream key resolution', () => {
+    // A resolver that knows exactly one caller and swaps it for that caller's
+    // upstream key; unknown callers resolve to null.
+    const resolver = async (key: string) => (key === 'tenant-a' ? 'sk-tenant-a' : null);
+    it('uses the resolved key as the upstream credential on the translated path', async () => {
+      let auth: string | undefined;
+      let key: string | undefined;
+      const { base } = await setup(
+        (req, res) => {
+          auth = req.headers.authorization;
+          key = req.headers['x-api-key'] as string | undefined;
+          res.end(JSON.stringify(output));
+        },
+        { upstreamApiKey: 'operator-secret', resolveUpstreamKey: resolver },
+      );
+      const result = await post(base, request, { 'x-api-key': 'tenant-a' });
+      expect(result.status).toBe(200);
+      expect(auth).toBe('Bearer sk-tenant-a');
+      // The operator's static key must not leak in alongside the resolved one.
+      expect(key).toBeUndefined();
+    });
+    it('sets x-api-key too on the native path', async () => {
+      let auth: string | undefined;
+      let key: string | undefined;
+      const { base } = await setup(
+        (req, res) => {
+          auth = req.headers.authorization;
+          key = req.headers['x-api-key'] as string | undefined;
+          res.end(JSON.stringify(output));
+        },
+        { upstreamApiKey: 'operator-secret', resolveUpstreamKey: resolver },
+      );
+      const result = await post(
+        base,
+        { ...request, model: 'anthropic/claude-sonnet-5-5' },
+        { 'x-api-key': 'tenant-a' },
+      );
+      expect(result.status).toBe(200);
+      expect(auth).toBe('Bearer sk-tenant-a');
+      expect(key).toBe('sk-tenant-a');
+    });
+    it('accepts the caller key as a bearer token', async () => {
+      let auth: string | undefined;
+      const { base } = await setup(
+        (req, res) => {
+          auth = req.headers.authorization;
+          res.end(JSON.stringify(output));
+        },
+        { resolveUpstreamKey: resolver },
+      );
+      const result = await post(base, request, { authorization: 'Bearer tenant-a' });
+      expect(result.status).toBe(200);
+      expect(auth).toBe('Bearer sk-tenant-a');
+    });
+    it.each([{}, { 'x-api-key': 'unknown-tenant' }, { 'x-api-key': 'tenant-b' }])(
+      'refuses an unresolved caller %j without reaching upstream',
+      async (headers) => {
+        let called = false;
+        const { base } = await setup(
+          () => {
+            called = true;
+          },
+          { upstreamApiKey: 'operator-secret', resolveUpstreamKey: resolver },
+        );
+        const result = await post(base, request, headers as Record<string, string>);
+        expect(result.status).toBe(401);
+        expect(called).toBe(false);
+      },
+    );
+    it('does not consult the resolver for health', async () => {
+      let resolved = 0;
+      const { base } = await setup(() => {}, {
+        resolveUpstreamKey: async (key: string) => {
+          resolved += 1;
+          return resolver(key);
+        },
+      });
+      expect(await (await fetch(base + '/healthz')).json()).toEqual({ status: 'ok' });
+      expect(resolved).toBe(0);
+    });
+  });
   it.each(['/v1/messages/count_tokens', '/v1/responses', '/unknown'])(
     'unsupported route %s',
     async (path) => {
