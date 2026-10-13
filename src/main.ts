@@ -27,14 +27,25 @@ function makeResolver(url: string, secret?: string) {
         },
       });
       if (response.status === 403) return { action: 'refuse' };
-      if (response.status !== 200) return { action: 'fallback' };
+      if (response.status !== 200)
+        return {
+          action: 'fallback',
+          // 404 = the caller is not one of ours; 401 = the resolver rejected our
+          // shared secret; anything else is the resolver's own error.
+          reason:
+            response.status === 404
+              ? 'unknown-caller'
+              : response.status === 401
+                ? 'resolver-secret-rejected'
+                : `resolver-http-${response.status}`,
+        };
       const body: unknown = await response.json();
       const value = (body as { upstream_api_key?: unknown } | null)?.upstream_api_key;
       return typeof value === 'string' && value.length
         ? { action: 'use', upstreamKey: value }
-        : { action: 'fallback' };
+        : { action: 'fallback', reason: 'resolver-empty' };
     } catch {
-      return { action: 'fallback' };
+      return { action: 'fallback', reason: 'resolver-unreachable' };
     }
   };
 }

@@ -49,7 +49,9 @@ export type GatewayConfig = {
 export type UpstreamKeyResolution =
   | { action: 'use'; upstreamKey: string }
   | { action: 'refuse' }
-  | { action: 'fallback' };
+  // `reason` is diagnostic only (logged under DEBUG_AUTH); it never changes the
+  // behaviour, which is the same fallback the request would take with no resolver.
+  | { action: 'fallback'; reason?: string };
 const HOP = new Set([
   'connection',
   'keep-alive',
@@ -388,17 +390,22 @@ export function createGateway(config: GatewayConfig) {
         // (`fallback`) leaves the static credential path below in charge, so a
         // shared gateway keeps serving callers this resolver does not own.
         const caller = callerKey(req);
-        const outcome = caller
+        const outcome: UpstreamKeyResolution = caller
           ? await config.resolveUpstreamKey(caller)
-          : ({ action: 'fallback' } as const);
+          : { action: 'fallback' };
         // Outcome only — never the key itself. DEBUG_AUTH=1 makes a misrouted
-        // or unkeyed caller visible instead of a bare 401.
+        // or unkeyed caller visible instead of a bare 401, and for a fallback
+        // the `reason` says which end failed (unknown caller, bad secret,
+        // unreachable).
         if (config.debugAuth)
           console.error(
             JSON.stringify({
               type: 'credential_resolution',
               presented: caller !== undefined,
               action: outcome.action,
+              ...(outcome.action === 'fallback' && outcome.reason
+                ? { reason: outcome.reason }
+                : {}),
             }),
           );
         if (outcome.action === 'use') resolvedKey = outcome.upstreamKey;
