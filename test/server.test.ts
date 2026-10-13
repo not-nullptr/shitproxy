@@ -8,7 +8,7 @@ import {
 } from 'node:http';
 import { once } from 'node:events';
 import { createHash } from 'node:crypto';
-import { createGateway, type GatewayConfig } from '../src/server.js';
+import { createGateway, type GatewayConfig, type UpstreamKeyResolution } from '../src/server.js';
 import { sse } from '../src/stream.js';
 const servers: Server[] = [];
 async function listen(server: Server): Promise<string> {
@@ -404,8 +404,13 @@ describe('HTTP routing and protocol integration', () => {
   });
   describe('per-request upstream key resolution', () => {
     // A resolver that knows exactly one caller and swaps it for that caller's
-    // upstream key; unknown callers resolve to null.
-    const resolver = async (key: string) => (key === 'tenant-a' ? 'sk-tenant-a' : null);
+    // upstream key. A different known caller (tenant-b) has no key set, so it is
+    // refused; anything else is not this resolver's caller, so it falls back.
+    const resolver = async (key: string): Promise<UpstreamKeyResolution> => {
+      if (key === 'tenant-a') return { action: 'use', upstreamKey: 'sk-tenant-a' };
+      if (key === 'tenant-b') return { action: 'refuse' };
+      return { action: 'fallback' };
+    };
     it('uses the resolved key as the upstream credential on the translated path', async () => {
       let auth: string | undefined;
       let key: string | undefined;
@@ -456,21 +461,62 @@ describe('HTTP routing and protocol integration', () => {
       expect(result.status).toBe(200);
       expect(auth).toBe('Bearer sk-tenant-a');
     });
-    it.each([{}, { 'x-api-key': 'unknown-tenant' }, { 'x-api-key': 'tenant-b' }])(
-      'refuses an unresolved caller %j without reaching upstream',
+    it('refuses a known caller with no key set, without reaching upstream', async () => {
+      let called = false;
+      const { base } = await setup(
+        () => {
+          called = true;
+        },
+        { upstreamApiKey: 'operator-secret', resolveUpstreamKey: resolver },
+      );
+      const result = await post(base, request, { 'x-api-key': 'tenant-b' });
+      expect(result.status).toBe(401);
+      expect(called).toBe(false);
+    });
+    // The point of the fallback: one shared gateway serves other deployments
+    // (and callers the resolver does not own) without breaking them.
+    it.each([{}, { 'x-api-key': 'other-deployment' }, { 'x-api-key': 'tenant-c' }])(
+      'falls back to the static key for an unrecognised caller %j',
       async (headers) => {
-        let called = false;
+        let auth: string | undefined;
         const { base } = await setup(
-          () => {
-            called = true;
+          (req, res) => {
+            auth = req.headers.authorization;
+            res.end(JSON.stringify(output));
           },
           { upstreamApiKey: 'operator-secret', resolveUpstreamKey: resolver },
         );
         const result = await post(base, request, headers as Record<string, string>);
-        expect(result.status).toBe(401);
-        expect(called).toBe(false);
+        expect(result.status).toBe(200);
+        expect(auth).toBe('Bearer operator-secret');
       },
     );
+    it('still applies the ingress gate to a fallback caller', async () => {
+      let called = false;
+      const { base } = await setup(
+        (_req, res) => {
+          called = true;
+          res.end(JSON.stringify(output));
+        },
+        { upstreamApiKey: 'operator-secret', clientApiKey: 'gate', resolveUpstreamKey: resolver },
+      );
+      expect((await post(base, request, { 'x-api-key': 'other-deployment' })).status).toBe(401);
+      expect(called).toBe(false);
+      // A resolved caller is authenticated by the resolver, not the ingress gate.
+      expect((await post(base, request, { 'x-api-key': 'tenant-a' })).status).toBe(200);
+    });
+    it('passes the caller key through when a fallback has no static key', async () => {
+      let auth: string | undefined;
+      const { base } = await setup(
+        (req, res) => {
+          auth = req.headers.authorization;
+          res.end(JSON.stringify(output));
+        },
+        { upstreamApiKey: undefined, resolveUpstreamKey: resolver },
+      );
+      expect((await post(base, request, { 'x-api-key': 'other-deployment' })).status).toBe(200);
+      expect(auth).toBe('Bearer other-deployment');
+    });
     it('does not consult the resolver for health', async () => {
       let resolved = 0;
       const { base } = await setup(() => {}, {

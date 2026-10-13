@@ -1,15 +1,23 @@
-import { createGateway } from './server.js';
+import { createGateway, type UpstreamKeyResolution } from './server.js';
 
 /**
  * Build the per-request upstream-key resolver from `UPSTREAM_KEY_RESOLVER_URL`.
  * The URL is an internal service that takes the caller's key on `X-Gateway-Key`
- * (with `GATEWAY_RESOLVER_SECRET` on `X-Gateway-Secret`) and answers
- * `{ "upstream_api_key": "..." }` for a key it recognises. Anything else — an
- * unknown key, a refusal, a malformed or failing response — resolves to `null`,
- * which the gateway turns into a 401 rather than a shared-key fallback.
+ * (with `GATEWAY_RESOLVER_SECRET` on `X-Gateway-Secret`) and answers:
+ *
+ *   200 {"upstream_api_key": "..."} — this caller's own key; use it.
+ *   403                             — a known caller with no usable key; refuse
+ *                                     (401 downstream), never the shared key.
+ *   anything else                   — 404 unknown caller, 401 bad secret, 5xx,
+ *                                     or a transport failure: `fallback`, i.e.
+ *                                     the static `UPSTREAM_API_KEY` / ingress
+ *                                     gate, exactly as with no resolver. This
+ *                                     keeps other deployments on the same
+ *                                     gateway working, and keeps it serving
+ *                                     during a resolver outage.
  */
 function makeResolver(url: string, secret?: string) {
-  return async (key: string): Promise<string | null> => {
+  return async (key: string): Promise<UpstreamKeyResolution> => {
     try {
       const response = await fetch(url, {
         method: 'POST',
@@ -18,12 +26,15 @@ function makeResolver(url: string, secret?: string) {
           ...(secret ? { 'x-gateway-secret': secret } : {}),
         },
       });
-      if (!response.ok) return null;
+      if (response.status === 403) return { action: 'refuse' };
+      if (response.status !== 200) return { action: 'fallback' };
       const body: unknown = await response.json();
       const value = (body as { upstream_api_key?: unknown } | null)?.upstream_api_key;
-      return typeof value === 'string' && value.length ? value : null;
+      return typeof value === 'string' && value.length
+        ? { action: 'use', upstreamKey: value }
+        : { action: 'fallback' };
     } catch {
-      return null;
+      return { action: 'fallback' };
     }
   };
 }

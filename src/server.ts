@@ -30,14 +30,25 @@ export type GatewayConfig = {
   search?: Searcher;
   /**
    * Per-request upstream credential resolution. When set, the caller's own
-   * `x-api-key` (or bearer) is treated as an opaque identity and swapped for the
-   * upstream key this function returns; a `null` result refuses the request with
-   * a 401. Resolution is authoritative — `upstreamApiKey` is not used as a
-   * fallback, so an unrecognised caller never spends the operator's key. This
-   * lets a multi-tenant front end bill each caller's inference to their own key.
+   * `x-api-key` (or bearer) is treated as an opaque identity and looked up here:
+   *
+   *   - `use`      — send the request upstream with `upstreamKey`.
+   *   - `refuse`   — a known caller with no usable key: answer 401, so it never
+   *                  spends the shared key. This is the per-tenant guarantee.
+   *   - `fallback` — a caller this resolver does not know, or a resolver
+   *                  failure: use the static `upstreamApiKey` (and the
+   *                  `clientApiKey` ingress gate) exactly as without a resolver.
+   *                  This is what keeps other deployments sharing one gateway
+   *                  working, so enabling resolution here does not break them.
    */
-  resolveUpstreamKey?: (key: string) => Promise<string | null>;
+  resolveUpstreamKey?: (key: string) => Promise<UpstreamKeyResolution>;
 };
+
+/** The outcome of looking up a caller's key. See `resolveUpstreamKey`. */
+export type UpstreamKeyResolution =
+  | { action: 'use'; upstreamKey: string }
+  | { action: 'refuse' }
+  | { action: 'fallback' };
 const HOP = new Set([
   'connection',
   'keep-alive',
@@ -371,18 +382,20 @@ export function createGateway(config: GatewayConfig) {
       }
       let resolvedKey: string | undefined;
       if (config.resolveUpstreamKey) {
-        // Multi-tenant: the caller's own key identifies them. Swap it for the
-        // upstream credential this request should use. An unknown caller is
-        // refused rather than falling back to a shared key, so one tenant's
-        // inference can never be billed to the operator's key.
+        // The caller's own key identifies them. `use` swaps in their upstream
+        // key; `refuse` is a known caller with no usable key; anything else
+        // (`fallback`) leaves the static credential path below in charge, so a
+        // shared gateway keeps serving callers this resolver does not own.
         const caller = callerKey(req);
-        const resolved = caller ? await config.resolveUpstreamKey(caller) : null;
-        if (!resolved)
+        const outcome = caller
+          ? await config.resolveUpstreamKey(caller)
+          : ({ action: 'fallback' } as const);
+        if (outcome.action === 'use') resolvedKey = outcome.upstreamKey;
+        else if (outcome.action === 'refuse')
           throw new ProtocolError('Invalid gateway API key', 401, 'authentication_error');
-        resolvedKey = resolved;
-      } else if (config.clientApiKey && !authorized(req, config.clientApiKey)) {
-        throw new ProtocolError('Invalid gateway API key', 401, 'authentication_error');
       }
+      if (!resolvedKey && config.clientApiKey && !authorized(req, config.clientApiKey))
+        throw new ProtocolError('Invalid gateway API key', 401, 'authentication_error');
       const models = url.pathname === '/v1/models' && req.method === 'GET';
       const messages = url.pathname === '/v1/messages' && req.method === 'POST';
       if (!models && !messages)
