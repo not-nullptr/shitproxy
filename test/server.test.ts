@@ -472,6 +472,10 @@ describe('HTTP routing and protocol integration', () => {
       const result = await post(base, request, { 'x-api-key': 'tenant-b' });
       expect(result.status).toBe(401);
       expect(called).toBe(false);
+      // Distinct from the ingress-gate 401, so the two are not confused.
+      expect(((await result.json()) as { error: { message: string } }).error.message).toMatch(
+        /no upstream api key/i,
+      );
     });
     // The point of the fallback: one shared gateway serves other deployments
     // (and callers the resolver does not own) without breaking them.

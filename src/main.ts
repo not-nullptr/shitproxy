@@ -69,6 +69,7 @@ const server = createGateway({
   debugStream: process.env.DEBUG_STREAM === '1',
   debugCache: process.env.DEBUG_CACHE === '1',
   debugErrors: process.env.DEBUG_ERRORS === '1',
+  debugAuth: process.env.DEBUG_AUTH === '1',
   resolveUpstreamKey: resolverUrl
     ? makeResolver(resolverUrl, process.env.GATEWAY_RESOLVER_SECRET)
     : undefined,

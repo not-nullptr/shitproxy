@@ -25,6 +25,7 @@ export type GatewayConfig = {
   debugStream?: boolean;
   debugCache?: boolean;
   debugErrors?: boolean;
+  debugAuth?: boolean;
   kagiSession?: string;
   kagiTurnstile?: string;
   search?: Searcher;
@@ -390,9 +391,26 @@ export function createGateway(config: GatewayConfig) {
         const outcome = caller
           ? await config.resolveUpstreamKey(caller)
           : ({ action: 'fallback' } as const);
+        // Outcome only — never the key itself. DEBUG_AUTH=1 makes a misrouted
+        // or unkeyed caller visible instead of a bare 401.
+        if (config.debugAuth)
+          console.error(
+            JSON.stringify({
+              type: 'credential_resolution',
+              presented: caller !== undefined,
+              action: outcome.action,
+            }),
+          );
         if (outcome.action === 'use') resolvedKey = outcome.upstreamKey;
         else if (outcome.action === 'refuse')
-          throw new ProtocolError('Invalid gateway API key', 401, 'authentication_error');
+          // A caller authd knows but that has no upstream key set. Distinct from
+          // an unknown caller (which falls back) and from a bad ingress key, so
+          // the three are not mistaken for one another in a log.
+          throw new ProtocolError(
+            'No upstream API key is set for this account',
+            401,
+            'authentication_error',
+          );
       }
       if (!resolvedKey && config.clientApiKey && !authorized(req, config.clientApiKey))
         throw new ProtocolError('Invalid gateway API key', 401, 'authentication_error');
